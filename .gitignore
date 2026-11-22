@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.deb
+*.mjpeg
+*.mp4
+packaging/stage/
+*.log
