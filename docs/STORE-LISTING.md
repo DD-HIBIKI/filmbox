@@ -47,7 +47,33 @@
 **Categories**: Media, Creative & Office
 **Share code**: `CYBK`
 
-## 三、上架流程（CardputerZero AppStore）
+## 三、上架流程（两条路，选一条）
+
+### 路线 A — 网页端（Windows 上最省事，推荐）
+
+打开 <https://dev.cardputer.cc> → **使用 GitHub 登录**（授权一次即可）。
+登录后是「上传 / 管理」页：
+
+1. **拖入 `.deb`**（`filmbox_0.6.0_all.deb`）。页面会读取包名和版本。
+2. **选择 `app-builder.json`** 让页面自动填表 —— 页面明确写了「选择后立即在本地解析，不会上传」，
+   所以 summary / description / categories / author / share_code / permissions 都会预先填好。
+3. **单独上传截图**（1–6 张 320×170 PNG）和**图标**（256 或 512 方图）——
+   这两个是文件，不能靠 json 里的相对路径带上去。
+4. 检查权限勾选，提交。页面会提一个 metadata PR 并上传 deb 到 Release。
+5. 首次发布：去 PR 里贴一段真机运行视频，管理员看完合并 → 应用上线。
+
+需要准备的文件（都在 `G:\iPhone\filmbox\`）：
+
+```
+filmbox_0.6.0_all.deb
+app-builder.json          ← 仓库根目录那份
+screenshots/01..06.png    ← 6 张 320×170
+icon-256.png              ← 或 512
+```
+
+### 路线 B — 命令行 `czdev`
+
+## 三、上架流程（CardputerZero AppStore，CLI）
 
 官方工具是 `czdev`（M5Stack / CardputerZero-AppBuilder），流程如下：
 
