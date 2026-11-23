@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.6.9"
+VERSION = "0.7.1"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -1075,15 +1075,15 @@ def _accel_status():
 
 
 GRAIN_STRENGTH = 5.0
-GPU_MAX_PIXELS = 8_500_000
-GPU_MIN_FREE_MB = 90
+GPU_MAX_PIXELS = 5_000_000
+GPU_MIN_FREE_MB = 80
 _ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
 
 
-def film_copy(image, cube_path, progress=None):
+def film_copy(image, cube_path, progress=None, gpu_budget=None):
     """Apply LUT + halation + grain with the best available engine.
 
     Order: GPU → multi-core → single-threaded CPU.  Any failure falls through,
@@ -1103,8 +1103,9 @@ def film_copy(image, cube_path, progress=None):
                     _GPU_STATE = 2
                     with camera_log() as log:
                         log.write(("FilmBox accel: no GPU (%s)\n" % exc).encode())
+        free_now = available_mb() if gpu_budget is None else gpu_budget
         if (_GPU_STATE == 1 and image.width * image.height <= GPU_MAX_PIXELS
-                and available_mb() >= GPU_MIN_FREE_MB):
+                and free_now >= GPU_MIN_FREE_MB):
             try:
                 out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH)
                 if progress:
@@ -1148,6 +1149,9 @@ def filtered_still(original, mode, progress=None, full_res=None):
     is_lut = mode.startswith(LUT_PREFIX)
     # Measure free RAM *before* decoding: an 8MP RGB copy alone eats ~24 MB.
     want_full = LUT_FULL_RES if full_res is None else bool(full_res)
+    # Decide the GPU budget before decoding: an 8 MP RGB decode costs ~24 MB,
+    # so measuring after it always looks "too tight" and silently falls back.
+    gpu_budget = available_mb() - 24
     room_for_full = available_mb() >= 75
     with Image.open(original) as handle:
         image = handle.convert("RGB")
@@ -1158,7 +1162,7 @@ def filtered_still(original, mode, progress=None, full_res=None):
                 image = image.resize((int(image.width * scale), int(image.height * scale)),
                                      Image.Resampling.BOX)
             result = film_copy(image, LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube"),
-                               progress)
+                               progress, gpu_budget)
         else:
             result = filter_image(image, mode)
     if is_lut:

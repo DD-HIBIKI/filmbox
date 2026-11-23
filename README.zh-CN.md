@@ -134,7 +134,7 @@ selftest.py                相机层自检
 |---|---|---|
 | `cpu`（默认） | **5.1–6.5 秒** | 稳定，Pillow `Color3DLUT` + 整数颗粒 |
 | `multi` | 2MP：1.55 秒；8MP：不可行 | fork 2 个进程；8MP 时 fork 副本 + 每个进程一张 Pillow 缓冲就触发 OOM，因此限制在 ≤2.5MP |
-| `gpu` | 内存充足（≥90MB）时 8MP **3.0–4.8 秒** | EGL 无窗口 + GLES2，1024 分块。必须先 `mallopt(M_MMAP_THRESHOLD, 1MB)`，否则 vc4 驱动在 `glTexImage2D` 里段错误（glibc 的 arena 增长会打碎驱动要的连续区）。内存紧张时自动回退 CPU。 |
+| `gpu` | ≤5MP：1.1–1.9 秒 | EGL 无窗口 + GLES2。用 `mallopt(M_MMAP_THRESHOLD, 1MB)` 修掉 vc4 段错误。8MP 时整图 + 输出缓冲在 352MB 机器上余量不足、驱动会崩，所以 8MP 仍走 CPU。 |
 
 `filmbox diagnose` 会打印当前生效的引擎。GPU 与多核代码保留在 `filmbox.py` 里
 （可运行的原型在 `tools/gpu_lut.py`），以便在正常的驱动上再修。
