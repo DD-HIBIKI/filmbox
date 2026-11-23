@@ -36,3 +36,11 @@ not affiliated with or endorsed by any of those companies.
 Every screenshot in `screenshots/` was rendered by `tools/mockshots.py` from
 procedurally generated scenes (`tools/gen_scenes.py`). No photograph of a real
 person or place is used.
+
+
+## Acceleration
+
+`filmbox.py` can render film copies on the GPU (EGL surfaceless + GLES2, tiled
+to the driver's maximum texture size) or across CPU cores with `fork`. Both are
+optional and chosen at runtime (`FILMBOX_ACCEL=auto|gpu|multi|cpu`); any failure
+falls back to the single-threaded path in the same file.

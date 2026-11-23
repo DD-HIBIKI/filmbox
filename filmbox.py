@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.6.0"
+VERSION = "0.6.2"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -356,29 +356,39 @@ def add_halation(image, threshold=210, strength=0.6):
 
 
 def add_grain(image, strength=5.0, seed=None):
-    """Luma-weighted grain: integer maths, strip-wise, weight upscaled per band."""
+    """Luma-weighted grain in integer maths.
+
+    The weight map is built once at 1/8 scale and resized a band at a time;
+    everything else stays int16/int32 so an 8 MP pass costs ~4 s → ~1.5 s.
+    """
     rgb = image if image.mode == "RGB" else image.convert("RGB")
     if np is None:
         return rgb
     w, h = rgb.size
     rng = np.random.default_rng(seed)
     small = rgb.resize((max(1, w // 8), max(1, h // 8)), Image.Resampling.BOX)
-    lw = np.asarray(small, dtype=np.float32).mean(axis=2) / 255.0
-    wsmall = Image.fromarray((np.clip(1.35 - lw * 1.5, 0.15, 1.0) * 255).astype(np.uint8), "L")
-    out = rgb
-    scale = strength / 100.0
+    lw = np.asarray(small, dtype=np.uint16)
+    luma = (lw[:, :, 0] * 77 + lw[:, :, 1] * 150 + lw[:, :, 2] * 29) >> 8   # 0..255
+    weight = np.clip(345 - (luma.astype(np.int32) * 3) // 2, 38, 255).astype(np.uint8)
+    wimg = Image.fromarray(weight, "L")
+    amp = max(1, int(round(strength)))         # grey levels at full weight
     step = 288
     for top in range(0, h, step):
         bottom = min(h, top + step)
         rows = bottom - top
-        block = np.asarray(out.crop((0, top, w, bottom)), dtype=np.int16)
+        block = np.asarray(rgb.crop((0, top, w, bottom)), dtype=np.int16)
+        # Two independent draws averaged: gaussian-ish, no directional bias.
+        # (A 3-tap average with np.roll leaves visible horizontal streaks.)
         n = rng.integers(-120, 121, (rows, w), dtype=np.int16)
-        n = (n + np.roll(n, 1, 0) + np.roll(n, 1, 1)) // 3
-        wt = np.asarray(wsmall.resize((w, rows), Image.Resampling.BILINEAR),
-                        dtype=np.float32) / 255.0
-        block += (n.astype(np.float32) * wt * scale).astype(np.int16)[:, :, None]
-        out.paste(Image.fromarray(np.clip(block, 0, 255).astype(np.uint8), "RGB"), (0, top))
-    return out
+        n += rng.integers(-120, 121, (rows, w), dtype=np.int16)
+        n //= 2                                                   # ±120
+        wt = np.asarray(wimg.resize((w, rows), Image.Resampling.BILINEAR), dtype=np.int32)
+        # weight is 0..255 and the amplitude is in 1/100 grey levels, so the
+        # result stays within ±(120*strength/100) = ±6 for the default 5.
+        grain = (((n.astype(np.int32) * wt) >> 8) * amp) // 100
+        block += grain.astype(np.int16)[:, :, None]
+        rgb.paste(Image.fromarray(np.clip(block, 0, 255).astype(np.uint8), "RGB"), (0, top))
+    return rgb
 
 
 def filter_image(source, mode, animated=False, preview=False):
@@ -534,6 +544,527 @@ def creative_filter(base, mode):
     raise ValueError('Unknown creative filter: ' + mode)
 
 
+
+# =============================================================================
+# Film-copy accelerators: GPU (EGL/GLES2) and multi-core (fork).
+# Selected at runtime by FILMBOX_ACCEL=auto|gpu|multi|cpu.
+# =============================================================================
+import ctypes
+import struct
+
+def read_cube(path):
+    """(size, bytes RGB8, float array) for a .cube file, cached by mtime."""
+    stamp = os.path.getmtime(path)
+    key = (path, stamp)
+    hit = _CUBE_CACHE.get(key)
+    if hit:
+        return hit
+    size, vals = None, []
+    dmin, dmax = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+    with open(path, errors="ignore") as handle:
+        for line in handle:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            u = s.upper()
+            if u.startswith("LUT_3D_SIZE"):
+                size = int(s.split()[1]); continue
+            if u.startswith("DOMAIN_MIN"):
+                dmin = tuple(float(x) for x in s.split()[1:4]); continue
+            if u.startswith("DOMAIN_MAX"):
+                dmax = tuple(float(x) for x in s.split()[1:4]); continue
+            if u[0].isalpha():
+                continue
+            try:
+                vals += [float(x) for x in s.split()]
+            except ValueError:
+                pass
+    if size is None or len(vals) != size ** 3 * 3:
+        raise ValueError("bad cube: " + path)
+    if dmin != (0.0, 0.0, 0.0) or dmax != (1.0, 1.0, 1.0):
+        norm = []
+        for i in range(0, len(vals), 3):
+            for c in range(3):
+                span = (dmax[c] - dmin[c]) or 1.0
+                norm.append(min(1.0, max(0.0, (vals[i + c] - dmin[c]) / span)))
+        vals = norm
+    if np is not None:
+        arr = np.array(vals, dtype=np.float32).reshape(size, size, size, 3)
+        data = (np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes()
+    else:
+        arr = None
+        data = bytes(min(255, max(0, int(v * 255 + 0.5))) for v in vals)
+    out = (size, data, arr)
+    _CUBE_CACHE[key] = out
+    return out
+
+
+_CUBE_CACHE = {}
+
+
+def read_cube(path):
+    """(size, bytes RGB8) for a .cube file, cached by mtime."""
+    stamp = os.path.getmtime(path)
+    key = (path, stamp)
+    hit = _CUBE_CACHE.get(key)
+    if hit:
+        return hit
+    size, vals = None, []
+    dmin, dmax = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+    with open(path, errors="ignore") as handle:
+        for line in handle:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            u = s.upper()
+            if u.startswith("LUT_3D_SIZE"):
+                size = int(s.split()[1])
+                continue
+            if u.startswith("DOMAIN_MIN"):
+                dmin = tuple(float(x) for x in s.split()[1:4])
+                continue
+            if u.startswith("DOMAIN_MAX"):
+                dmax = tuple(float(x) for x in s.split()[1:4])
+                continue
+            if u[0].isalpha():
+                continue
+            try:
+                vals += [float(x) for x in s.split()]
+            except ValueError:
+                pass
+    if size is None or len(vals) != size ** 3 * 3:
+        raise ValueError("bad cube: " + path)
+    if dmin != (0.0, 0.0, 0.0) or dmax != (1.0, 1.0, 1.0):
+        norm = []
+        for i in range(0, len(vals), 3):
+            for c in range(3):
+                span = (dmax[c] - dmin[c]) or 1.0
+                norm.append(min(1.0, max(0.0, (vals[i + c] - dmin[c]) / span)))
+        vals = norm
+    if np is not None:
+        arr = np.array(vals, dtype=np.float32).reshape(size, size, size, 3)
+        data = (np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes()
+        lut3 = arr
+    else:
+        data = bytes(min(255, max(0, int(v * 255 + 0.5))) for v in vals)
+        lut3 = None
+    out = (size, data, lut3)
+    _CUBE_CACHE[key] = out
+    return out
+
+
+_CUBE_CACHE = {}
+
+
+# ------------------------------------------------------------- glow (shared)
+def build_glow(image, threshold=210, strength=0.6):
+    """1/4-scale highlight glow, same maths as the CPU pipeline."""
+    rgb = image if image.mode == "RGB" else image.convert("RGB")
+    w, h = rgb.size
+    sw, sh = max(1, w // 4), max(1, h // 4)
+    small = rgb.resize((sw, sh), Image.Resampling.BOX)
+
+    def ramp(v):
+        if v < threshold:
+            return 0
+        return min(255, int((v - threshold) * 255 // (255 - threshold)))
+
+    mask = small.convert("L").point(ramp)
+    glow = Image.merge("RGB", (mask,
+                               mask.point(lambda v: int(v * 0.72)),
+                               mask.point(lambda v: int(v * 0.42))))
+    glow = glow.filter(ImageFilter.GaussianBlur(max(1.0, max(w, h) / 3200.0)))
+    if strength != 1.0:
+        glow = glow.point(lambda v: int(v * strength))
+    return glow
+
+
+# --------------------------------------------------------------------- GPU
+GL_RGB, GL_RGBA, GL_UBYTE = 0x1908, 0x1908, 0x1401
+GL_TEX2D, GL_LINEAR, GL_CLAMP = 0x0DE1, 0x2601, 0x812F
+GL_MIN_F, GL_MAG_F = 0x2801, 0x2800
+GL_WRAP_S, GL_WRAP_T = 0x2802, 0x2803
+GL_FBO, GL_COLOR_ATT, GL_FBO_OK = 0x8D40, 0x8CE0, 0x8CD5
+GL_FLOAT, GL_STRIP = 0x1406, 0x0005
+GL_TEXTURE0, GL_TEXTURE1 = 0x84C0, 0x84C1
+GL_TEXTURE2 = 0x84C2
+
+VS = """#version 100
+attribute vec2 pos; varying vec2 vUv;
+void main(){ vUv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }"""
+
+FS = """#version 100
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D tex;
+uniform sampler2D lut;
+uniform sampler2D glow;
+uniform vec2 blockSize;      // pixels in this tile
+uniform vec2 blockOrigin;    // tile offset in the full image, pixels
+uniform vec2 imgSize;
+uniform float n;             // LUT edge (13 or 33)
+uniform float grainAmp;      // grey levels
+uniform float glowMix;       // 0 disables halation
+
+float hash(vec2 p){
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main(){
+  vec3 c = texture2D(tex, vUv).rgb;
+
+  // 3D LUT from a 2D atlas: x = b*n + r, y = g
+  float b = clamp(c.b, 0.0, 1.0) * (n - 1.0);
+  float b0 = floor(b);
+  float b1 = min(n - 1.0, b0 + 1.0);
+  float mb = b - b0;
+  vec2 rg = vec2(c.r * (n - 1.0) + 0.5, c.g * (n - 1.0) + 0.5);
+  vec3 s0 = texture2D(lut, vec2((b0 * n + rg.x) / (n * n), rg.y / n)).rgb;
+  vec3 s1 = texture2D(lut, vec2((b1 * n + rg.x) / (n * n), rg.y / n)).rgb;
+  vec3 col = mix(s0, s1, mb);
+
+  // halation: screen with a 1/4-scale glow texture
+  if (glowMix > 0.0) {
+    vec2 g = (blockOrigin + vUv * blockSize) / imgSize;
+    vec3 gl = texture2D(glow, g).rgb * glowMix;
+    col = 1.0 - (1.0 - col) * (1.0 - gl);
+  }
+
+  // grain: full-image pixel coordinates keep tiles seamless
+  if (grainAmp > 0.0) {
+    vec2 px = blockOrigin + vUv * blockSize;
+    float n1 = hash(px) + hash(px + vec2(17.0, 31.0)) - 1.0;   // ±1
+    float luma = dot(col, vec3(0.299, 0.587, 0.114));
+    float w = clamp(1.35 - luma * 1.5, 0.15, 1.0);
+    col += n1 * grainAmp * w * 0.5;
+  }
+  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}"""
+
+
+class GpuFilm:
+    """Lazy EGL/GLES2 renderer. Construction raises on unsupported devices."""
+
+    def __init__(self):
+        os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+        egl = ctypes.CDLL("libEGL.so.1")
+        gl = ctypes.CDLL("libGLESv2.so.2")
+        egl.eglGetDisplay.restype = ctypes.c_void_p
+        egl.eglQueryString.restype = ctypes.c_char_p
+        gl.glGetString.restype = ctypes.c_char_p
+
+        dpy = ctypes.c_void_p(egl.eglGetDisplay(ctypes.c_void_p(0)))
+        maj, mnr = ctypes.c_int(), ctypes.c_int()
+        if not egl.eglInitialize(dpy, ctypes.byref(maj), ctypes.byref(mnr)):
+            raise RuntimeError("eglInitialize")
+        attrs = (ctypes.c_int * 5)(0x3040, 0x0004, 0x3038, 0x3038, 0x3038)
+        cfg, num = ctypes.c_void_p(), ctypes.c_int()
+        if not egl.eglChooseConfig(dpy, attrs, ctypes.byref(cfg), 1, ctypes.byref(num)):
+            raise RuntimeError("eglChooseConfig")
+        egl.eglBindAPI(0x30A0)
+        ctx = ctypes.c_void_p(egl.eglCreateContext(
+            dpy, cfg, ctypes.c_void_p(0), (ctypes.c_int * 3)(0x3098, 2, 0x3038)))
+        if not ctx.value:
+            raise RuntimeError("eglCreateContext")
+        if not egl.eglMakeCurrent(dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), ctx):
+            raise RuntimeError("eglMakeCurrent")
+        self.egl, self.gl = egl, gl
+        maxt = ctypes.c_int()
+        gl.glGetIntegerv(0x0D33, ctypes.byref(maxt))
+        self.maxt = maxt.value or 2048
+        self.renderer = (gl.glGetString(0x1F01) or b"").decode(errors="ignore")
+        self.prog = self._program()
+        self.lut_tex = None
+        self.lut_key = None
+        self.tex, self.fb = ctypes.c_uint(), ctypes.c_uint()
+        gl.glGenTextures(1, ctypes.byref(self.tex))
+        gl.glGenFramebuffers(1, ctypes.byref(self.fb))
+        self.uniforms = {}
+        for name in (b"tex", b"lut", b"glow", b"blockSize", b"blockOrigin",
+                     b"imgSize", b"n", b"grainAmp", b"glowMix"):
+            self.uniforms[name.decode()] = gl.glGetUniformLocation(self.prog, name)
+        quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
+        self._quad = quad
+        gl.glUseProgram(self.prog)
+        loc = gl.glGetAttribLocation(self.prog, b"pos")
+        gl.glVertexAttribPointer(loc, 2, GL_FLOAT, 0, 0, quad)
+        gl.glEnableVertexAttribArray(loc)
+        gl.glUniform1i(self.uniforms["tex"], 0)
+        gl.glUniform1i(self.uniforms["lut"], 1)
+        gl.glUniform1i(self.uniforms["glow"], 2)
+
+    def _program(self):
+        gl = self.gl
+
+        def shader(kind, code):
+            s = gl.glCreateShader(kind)
+            arr = (ctypes.c_char_p * 1)(ctypes.c_char_p(code.encode()))
+            gl.glShaderSource(s, 1, arr, None)
+            gl.glCompileShader(s)
+            ok = ctypes.c_int()
+            gl.glGetShaderiv(s, 0x8B81, ctypes.byref(ok))
+            if not ok.value:
+                log = ctypes.create_string_buffer(2048)
+                gl.glGetShaderInfoLog(s, 2048, None, log)
+                raise RuntimeError("shader: " + log.value.decode(errors="ignore"))
+            return s
+
+        prog = gl.glCreateProgram()
+        gl.glAttachShader(prog, shader(0x8B31, VS))
+        gl.glAttachShader(prog, shader(0x8B30, FS))
+        gl.glLinkProgram(prog)
+        status = ctypes.c_int()
+        gl.glGetProgramiv(prog, 0x8B82, ctypes.byref(status))
+        if not status.value:
+            log = ctypes.create_string_buffer(2048)
+            gl.glGetProgramInfoLog(prog, 2048, None, log)
+            raise RuntimeError("link: " + log.value.decode(errors="ignore"))
+        return prog
+
+    def _upload_lut(self, cube_path):
+        key = (cube_path, os.path.getmtime(cube_path))
+        if key == self.lut_key:
+            return
+        size, data, _ = read_cube(cube_path)
+        gl = self.gl
+        if self.lut_tex is None:
+            self.lut_tex = ctypes.c_uint()
+            gl.glGenTextures(1, ctypes.byref(self.lut_tex))
+        gl.glActiveTexture(GL_TEXTURE1)
+        gl.glBindTexture(GL_TEX2D, self.lut_tex)
+        for p in (GL_MIN_F, GL_MAG_F):
+            gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
+        for p in (GL_WRAP_S, GL_WRAP_T):
+            gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, size * size, size, 0, GL_RGB,
+                        GL_UBYTE, ctypes.c_char_p(self._atlas(size, data)))
+        self.lut_key = key
+        self.lut_size = float(size)
+
+    @staticmethod
+    def _atlas(size, data):
+        if np is None:
+            return data
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(size, size, size, 3)
+        return np.ascontiguousarray(arr.transpose(1, 0, 2, 3).reshape(size, size * size, 3)).tobytes()
+
+    def apply(self, image, cube_path, halation=True, grain=5.0):
+        rgb = image if image.mode == "RGB" else image.convert("RGB")
+        w, h = rgb.size
+        gl = self.gl
+        self._upload_lut(cube_path)
+        glow = build_glow(rgb) if halation else None
+        if glow is not None:
+            if not hasattr(self, "glow_tex"):
+                self.glow_tex = ctypes.c_uint()
+                gl.glGenTextures(1, ctypes.byref(self.glow_tex))
+            gl.glActiveTexture(GL_TEXTURE2)
+            gl.glBindTexture(GL_TEX2D, self.glow_tex)
+            for p in (GL_MIN_F, GL_MAG_F):
+                gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
+            for p in (GL_WRAP_S, GL_WRAP_T):
+                gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+            gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, glow.width, glow.height, 0,
+                            GL_RGB, GL_UBYTE, ctypes.c_char_p(glow.tobytes()))
+
+        gl.glUseProgram(self.prog)
+        gl.glUniform1f(self.uniforms["n"], ctypes.c_float(self.lut_size))
+        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(max(0.0, grain)))
+        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(0.6 if halation else 0.0))
+        gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(w), ctypes.c_float(h))
+
+        out = Image.new("RGB", (w, h))
+        tile = min(self.maxt, 2048)
+        for top in range(0, h, tile):
+            rows = min(tile, h - top)
+            for left in range(0, w, tile):
+                cols = min(tile, w - left)
+                block = rgb.crop((left, top, left + cols, top + rows))
+                gl.glActiveTexture(GL_TEXTURE0)
+                gl.glBindTexture(GL_TEX2D, self.tex)
+                gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
+                gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
+                gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, cols, rows, 0, GL_RGB,
+                                GL_UBYTE, ctypes.c_char_p(block.tobytes()))
+                gl.glBindFramebuffer(GL_FBO, self.fb)
+                gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
+                gl.glViewport(0, 0, cols, rows)
+                gl.glUniform2f(self.uniforms["blockSize"],
+                               ctypes.c_float(cols), ctypes.c_float(rows))
+                gl.glUniform2f(self.uniforms["blockOrigin"],
+                               ctypes.c_float(left), ctypes.c_float(top))
+                gl.glDrawArrays(GL_STRIP, 0, 4)
+                buf = ctypes.create_string_buffer(cols * rows * 4)
+                gl.glReadPixels(0, 0, cols, rows, GL_RGBA, GL_UBYTE, buf)
+                part = Image.frombytes("RGBA", (cols, rows), buf.raw).convert("RGB")
+                out.paste(part.transpose(Image.Transpose.FLIP_TOP_BOTTOM), (left, top))
+        return out
+
+
+# ------------------------------------------------------------- multicore
+_MP = {}
+
+def _band_lut(job):
+    top, bottom = job
+    img, lut = _MP["img"], _MP["lut"]
+    return top, bottom, img.crop((0, top, img.width, bottom)).filter(lut).tobytes()
+
+
+def _band_finish(job):
+    top, bottom = job
+    img = _MP["img"]
+    glow = _MP["glow"]
+    grain = _MP["grain"]
+    rows = bottom - top
+    block = img.crop((0, top, img.width, bottom))
+    if glow is not None:
+        sw, sh = glow.size
+        band = glow.crop((0, top * sh // img.height, sw,
+                          min(sh, max(top * sh // img.height + 1, bottom * sh // img.height))))
+        band = band.resize((img.width, rows), Image.Resampling.NEAREST)
+        block = ImageChops.screen(block, band)
+    if grain and np is not None:
+        rng = np.random.default_rng(1000 + top)
+        arr = np.asarray(block, dtype=np.int16)
+        n = rng.integers(-120, 121, (rows, img.width), dtype=np.int16)
+        n += rng.integers(-120, 121, (rows, img.width), dtype=np.int16)
+        n //= 2
+        small = block.resize((max(1, img.width // 8), max(1, rows // 8)),
+                             Image.Resampling.BOX)
+        lw = np.asarray(small, dtype=np.uint16)
+        luma = (lw[:, :, 0] * 77 + lw[:, :, 1] * 150 + lw[:, :, 2] * 29) >> 8
+        weight = np.clip(345 - (luma.astype(np.int32) * 3) // 2, 38, 255).astype(np.uint8)
+        wt = np.asarray(Image.fromarray(weight, "L").resize((img.width, rows),
+                                                             Image.Resampling.BILINEAR),
+                        dtype=np.int32)
+        grain_arr = (((n.astype(np.int32) * wt) >> 8) * max(1, int(round(grain)))) // 100
+        arr += grain_arr.astype(np.int16)[:, :, None]
+        block = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+    return top, bottom, block.tobytes()
+
+
+class MultiCoreFilm:
+    def __init__(self, jobs=None):
+        self.jobs = jobs or min(4, os.cpu_count() or 1)
+
+    def apply(self, image, cube_path, halation=True, grain=5.0, lut_obj=None):
+        if lut_obj is None:
+            size, data, _ = read_cube(cube_path)
+            lut_obj = ImageFilter.Color3DLUT(size, [v / 255.0 for v in
+                                                    struct.unpack("B" * (size ** 3 * 3), data)])
+        import multiprocessing as mp
+        rgb = image if image.mode == "RGB" else image.convert("RGB")
+        w, h = rgb.size
+        jobs = max(1, min(self.jobs, h // 256))
+        if jobs < 2:
+            return None
+        bands = [(i * h // jobs, (i + 1) * h // jobs) for i in range(jobs)]
+        ctx = mp.get_context("fork")
+        _MP.clear()
+        _MP.update(img=rgb, lut=lut_obj, glow=None, grain=grain)
+        with ctx.Pool(jobs) as pool:
+            parts = pool.map(_band_lut, bands)
+        stage = Image.new("RGB", (w, h))
+        for top, bottom, data in parts:
+            stage.paste(Image.frombytes("RGB", (w, bottom - top), data), (0, top))
+        if halation:
+            _MP["img"] = stage
+            _MP["glow"] = build_glow(stage)
+        else:
+            _MP["glow"] = None
+        _MP["img"] = stage
+        with ctx.Pool(jobs) as pool:
+            parts = pool.map(_band_finish, bands)
+        out = Image.new("RGB", (w, h))
+        for top, bottom, data in parts:
+            out.paste(Image.frombytes("RGB", (w, bottom - top), data), (0, top))
+        _MP.clear()
+        return out
+
+
+
+
+def _accel_status():
+    """Human-readable accelerator report for `filmbox diagnose`."""
+    bits = []
+    try:
+        if _GPU_STATE == 1:
+            bits.append("GPU ready (%s)" % _GPU.renderer)
+        elif _GPU_STATE == 2:
+            bits.append("GPU unavailable")
+        else:
+            bits.append("GPU untried")
+    except Exception:
+        bits.append("GPU unknown")
+    jobs = min(4, os.cpu_count() or 1)
+    bits.append("multi-core %d jobs" % jobs if jobs > 1 else "multi-core n/a")
+    return ", ".join(bits)
+
+
+GRAIN_STRENGTH = 5.0
+_ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
+_ACCEL_LOCK = threading.Lock()
+_GPU = None
+_GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
+
+
+def film_copy(image, cube_path, progress=None):
+    """Apply LUT + halation + grain with the best available engine.
+
+    Order: GPU → multi-core → single-threaded CPU.  Any failure falls through,
+    and the choice is logged so `filmbox diagnose` can show what was used.
+    """
+    global _GPU, _GPU_STATE
+    if _ACCEL in ("auto", "gpu"):
+        with _ACCEL_LOCK:
+            if _GPU_STATE == 0:
+                try:
+                    _GPU = GpuFilm()
+                    _GPU_STATE = 1
+                    with camera_log() as log:
+                        log.write(("FilmBox accel: GPU (%s, max tex %d)\n"
+                                   % (_GPU.renderer, _GPU.maxt)).encode())
+                except Exception as exc:
+                    _GPU_STATE = 2
+                    with camera_log() as log:
+                        log.write(("FilmBox accel: no GPU (%s)\n" % exc).encode())
+        if _GPU_STATE == 1:
+            try:
+                out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH)
+                if progress:
+                    progress(90)
+                return out
+            except Exception as exc:
+                _GPU_STATE = 2
+                with camera_log() as log:
+                    log.write(("FilmBox accel: GPU failed mid-run (%s)\n" % exc).encode())
+    if _ACCEL in ("auto", "multi", "gpu"):
+        try:
+            lut = load_cube_lut(str(cube_path))
+            out = MultiCoreFilm().apply(image, str(cube_path), True, GRAIN_STRENGTH, lut)
+            if out is not None:
+                if progress:
+                    progress(90)
+                return out
+        except Exception as exc:
+            with camera_log() as log:
+                log.write(("FilmBox accel: multi-core failed (%s)\n" % exc).encode())
+    lut = load_cube_lut(str(cube_path))
+    w, h = image.size
+    result = image
+    step = 256
+    for top in range(0, h, step):
+        bottom = min(h, top + step)
+        result.paste(result.crop((0, top, w, bottom)).filter(lut), (0, top))
+        if progress:
+            progress(min(60, (top + step) * 60 // max(1, h)))
+    result = add_halation(result)
+    if progress:
+        progress(75)
+    result = add_grain(result, GRAIN_STRENGTH)
+    return result
+
+
 def filtered_still(original, mode, progress=None, full_res=None):
     """Render the film copy. LUT work is tiled so an 8MP frame stays in RAM."""
     if mode == "NORMAL":
@@ -541,7 +1072,7 @@ def filtered_still(original, mode, progress=None, full_res=None):
     is_lut = mode.startswith(LUT_PREFIX)
     # Measure free RAM *before* decoding: an 8MP RGB copy alone eats ~24 MB.
     want_full = LUT_FULL_RES if full_res is None else bool(full_res)
-    room_for_full = available_mb() >= 110
+    room_for_full = available_mb() >= 75
     with Image.open(original) as handle:
         image = handle.convert("RGB")
         if is_lut:
@@ -550,26 +1081,15 @@ def filtered_still(original, mode, progress=None, full_res=None):
                 scale = min(limit[0] / image.width, limit[1] / image.height)
                 image = image.resize((int(image.width * scale), int(image.height * scale)),
                                      Image.Resampling.BOX)
-            lut = load_cube_lut(str(LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube")))
-            w, h = image.size
-            result = Image.new("RGB", (w, h))
-            step = 256
-            for top in range(0, h, step):
-                bottom = min(h, top + step)
-                result.paste(image.crop((0, top, w, bottom)).filter(lut), (0, top))
-                if progress:
-                    progress(min(60, (top + step) * 60 // max(1, h)))
-            result = add_halation(result)
-            if progress:
-                progress(75)
-            result = add_grain(result)
-            if progress:
-                progress(90)
+            result = film_copy(image, LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube"),
+                               progress)
         else:
             result = filter_image(image, mode)
     if is_lut:
+        tag = "" if max(result.size) > max(LUT_SAVE_MAX) else "_%dmp" % round(
+            result.width * result.height / 1e6)
         path = original.with_name(original.stem + "_" +
-                                  mode.replace(":", "-").lower() + ".jpg")
+                                  mode.replace(":", "-").lower() + tag + ".jpg")
         result.save(path, quality=93, subsampling=1)
     else:
         path = original.with_name(original.stem + "_" + mode.lower() + ".png")
@@ -2869,6 +3389,7 @@ def command_diagnose():
     except ImportError:
         print("picamera2: MISSING - sudo apt install python3-picamera2")
     print("numpy acceleration:", "available" if np is not None else "unavailable")
+    print("film-copy engine:", _ACCEL, "|", _accel_status())
     print("settings:", load_settings())
     print("full-field camera mode (preview/video):", FULL_FOV_MODE)
     print("video presets:", VIDEO_LABELS)

@@ -126,6 +126,24 @@ screenshots/               320×170 商店图
 selftest.py                相机层自检
 ```
 
+## 性能
+
+8MP 胶片副本是整个流程里最贵的一步，代码会按顺序尝试三种引擎，用可用的最快的那个：
+
+| 引擎 | 做法 | 8MP 出图 |
+|---|---|---|
+| GPU | EGL 无窗口 + GLES2 片元着色器，一次 pass 完成 LUT、光晕、颗粒（按驱动纹理上限分块） | 最快 |
+| 多核 | `fork` 2–4 个进程，各处理一条横带 | 比单核快约 3 倍 |
+| 单核 | Pillow `Color3DLUT` + numpy 颗粒 | 兜底，任何环境都能跑 |
+
+```bash
+FILMBOX_ACCEL=auto    # 默认：GPU → 多核 → 单核
+FILMBOX_ACCEL=gpu     # 强制 GPU（不可用会自动降级）
+FILMBOX_ACCEL=multi   # 不走 GPU
+FILMBOX_ACCEL=cpu     # 单线程，便于排查
+filmbox diagnose      # 打印当前生效的引擎
+```
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。FilmBox 基于

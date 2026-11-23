@@ -136,6 +136,25 @@ screenshots/            320×170 store images
 selftest.py             camera-layer self test
 ```
 
+## Performance
+
+Rendering an 8 MP film copy is the expensive part; three engines are tried in
+order and the best available wins:
+
+| Engine | How | 8 MP render |
+|---|---|---|
+| GPU | EGL surfaceless + GLES2 fragment shader (3D LUT, halation, grain in one pass, tiled to the driver's max texture size) | fastest |
+| Multi-core | `fork` 2–4 workers, each takes a band | ~3× faster than one core |
+| Single core | Pillow `Color3DLUT` + numpy grain | baseline, always works |
+
+```bash
+FILMBOX_ACCEL=auto    # default: GPU → multi-core → single core
+FILMBOX_ACCEL=gpu     # force GPU (falls back if unavailable)
+FILMBOX_ACCEL=multi   # skip the GPU
+FILMBOX_ACCEL=cpu     # single-threaded, easiest to debug
+filmbox diagnose      # prints which engine is active
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE). FilmBox is a fork of
