@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.7.3"
+VERSION = "0.7.4"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -2288,13 +2288,13 @@ def draw_share_overlay(url, width=320, height=170, error=None):
     else:
         left = 8
     host = url.split("//")[-1].split("/?")[0] if url else "no url"
-    d.text((left, 24), "SCAN TO DOWNLOAD", font=font(11, True), fill=MINT)
-    d.text((left, 41), host, font=font(11, True), fill=PAPER)
-    y = 64
-    for line in ("phone on same Wi-Fi", "scan, tap a photo", "save or share it"):
-        d.text((left, y), line, font=font(10), fill=(196, 216, 226))
-        y += 16
-    d.text((left, y + 2), "token protected", font=font(9), fill=(158, 180, 192))
+    d.text((left, 22), "SCAN TO DOWNLOAD", font=font(13, True), fill=MINT)
+    d.text((left, 41), host, font=font(13, True), fill=PAPER)
+    y = 68
+    for line in ("phone on Wi-Fi", "scan a photo", "save or share"):
+        d.text((left, y), line, font=font(13), fill=(206, 224, 232))
+        y += 20
+    d.text((left, y + 1), "token protected", font=font(10), fill=(168, 190, 202))
     return image
 
 
