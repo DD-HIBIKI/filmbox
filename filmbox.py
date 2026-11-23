@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -1148,7 +1148,7 @@ def _accel_status():
 GRAIN_STRENGTH = 5.0
 GPU_MAX_PIXELS = 5_000_000
 GPU_MIN_FREE_MB = 80
-_ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
+_ACCEL = os.environ.get("FILMBOX_ACCEL", "cpu").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
@@ -1161,31 +1161,17 @@ def film_copy(image, cube_path, progress=None, gpu_budget=None):
     and the choice is logged so `filmbox diagnose` can show what was used.
     """
     global _GPU, _GPU_STATE
-    if _ACCEL in ("auto", "gpu"):
-        with _ACCEL_LOCK:
-            if _GPU_STATE == 0:
-                try:
-                    _GPU = GpuFilm()
-                    _GPU_STATE = 1
-                    with camera_log() as log:
-                        log.write(("FilmBox accel: GPU (%s, max tex %d)\n"
-                                   % (_GPU.renderer, _GPU.maxt)).encode())
-                except Exception as exc:
-                    _GPU_STATE = 2
-                    with camera_log() as log:
-                        log.write(("FilmBox accel: no GPU (%s)\n" % exc).encode())
-        free_now = available_mb() if gpu_budget is None else gpu_budget
-        if (_GPU_STATE == 1 and image.width * image.height <= GPU_MAX_PIXELS
-                and free_now >= GPU_MIN_FREE_MB):
-            try:
-                out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH)
-                if progress:
-                    progress(90)
-                return out
-            except Exception as exc:
-                _GPU_STATE = 2
-                with camera_log() as log:
-                    log.write(("FilmBox accel: GPU failed mid-run (%s)\n" % exc).encode())
+    free_now = available_mb() if gpu_budget is None else gpu_budget
+    if _gpu_ready(image.width * image.height, free_now):
+        try:
+            out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH)
+            if progress:
+                progress(90)
+            return out
+        except Exception as exc:
+            _GPU_STATE = 2
+            with camera_log() as log:
+                log.write(("FilmBox accel: GPU failed mid-run (%s)\n" % exc).encode())
     if _ACCEL in ("auto", "multi", "gpu"):
         try:
             lut = load_cube_lut(str(cube_path))
@@ -1248,7 +1234,7 @@ def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None):
         with open(small, "rb") as sh_handle:
             thumb = Image.frombuffer("RGB", (sw, sh), sh_handle.read(), "raw", "RGB", 0, 1)
             glow = build_glow(thumb) if True else None
-        gpu = _gpu_ready(w * h)
+        gpu = _gpu_ready(w * h, available_mb())
         done = 0
         for top in range(0, h, step):
             rows = min(step, h - top)
@@ -1263,9 +1249,16 @@ def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None):
     return out
 
 
-def _gpu_ready(pixels):
+def _gpu_ready(pixels, free_mb=None):
     global _GPU, _GPU_STATE
     if _ACCEL in ("cpu", "multi"):
+        return False
+    # Refuse BEFORE touching EGL: GpuFilm.__init__ calls mallopt(), which slows
+    # every later Pillow allocation in this process. Initialising it for a frame
+    # that will not use the GPU costs ~2.4 s on an 8 MP render.
+    if pixels > GPU_MAX_PIXELS:
+        return False
+    if free_mb is not None and free_mb < GPU_MIN_FREE_MB:
         return False
     with _ACCEL_LOCK:
         if _GPU_STATE == 0:
@@ -1279,7 +1272,7 @@ def _gpu_ready(pixels):
                 _GPU_STATE = 2
                 with camera_log() as log:
                     log.write(("FilmBox accel: no GPU (%s)\n" % exc).encode())
-    return _GPU_STATE == 1 and pixels <= GPU_MAX_PIXELS
+    return _GPU_STATE == 1
 
 
 def _render_band(block, top, w, h, cube_path, glow, use_gpu):

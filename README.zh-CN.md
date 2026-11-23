@@ -132,9 +132,9 @@ selftest.py                相机层自检
 
 | 引擎 | 8MP 出图 | 状态 |
 |---|---|---|
-| `cpu`（默认） | **5.1–6.5 秒** | 稳定，Pillow `Color3DLUT` + 整数颗粒 |
+| `cpu`（默认） | **8MP：5.7 秒 / 2MP：1.2 秒** | Pillow `Color3DLUT` + 整数颗粒；`gpu_mem=64`（可用 415MB）的 Cardputer Zero 实测 |
 | `multi` | 2MP：1.55 秒；8MP：不可行 | fork 2 个进程；8MP 时 fork 副本 + 每个进程一张 Pillow 缓冲就触发 OOM，因此限制在 ≤2.5MP |
-| `gpu` | ≤5MP：1.1–1.9 秒 | EGL 无窗口 + GLES2。用 `mallopt(M_MMAP_THRESHOLD, 1MB)` 修掉 vc4 段错误。8MP 时整图 + 输出缓冲在 352MB 机器上余量不足、驱动会崩，所以 8MP 仍走 CPU。 |
+| `gpu` | 默认关闭 | 独立探针里 ≤5MP 可用，但接入应用后偶发段错误；建议保持 `FILMBOX_ACCEL=cpu` |
 
 `filmbox diagnose` 会打印当前生效的引擎。GPU 与多核代码保留在 `filmbox.py` 里
 （可运行的原型在 `tools/gpu_lut.py`），以便在正常的驱动上再修。
