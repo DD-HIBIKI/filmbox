@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -857,6 +857,77 @@ class GpuFilm:
             raise RuntimeError("link: " + log.value.decode(errors="ignore"))
         return prog
 
+    def _upload_glow(self, glow):
+        gl = self.gl
+        if glow is None:
+            return
+        key = (id(glow), glow.size)
+        if getattr(self, "_glow_key", None) == key:
+            return
+        if not hasattr(self, "glow_tex"):
+            self.glow_tex = ctypes.c_uint()
+            gl.glGenTextures(1, ctypes.byref(self.glow_tex))
+        gl.glActiveTexture(GL_TEXTURE2)
+        gl.glBindTexture(GL_TEX2D, self.glow_tex)
+        for p in (GL_MIN_F, GL_MAG_F):
+            gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
+        for p in (GL_WRAP_S, GL_WRAP_T):
+            gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+        gl.glPixelStorei(0x0CF5, 1)
+        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, glow.width, glow.height, 0,
+                        GL_RGB, GL_UBYTE, ctypes.c_char_p(glow.tobytes()))
+        self._glow_key = key
+
+    def apply_band(self, block, top, w, h, cube_path, glow, grain=5.0):
+        """Render one horizontal band with the shared LUT and glow textures."""
+        self._upload_lut(cube_path)
+        self._upload_glow(glow)
+        gl = self.gl
+        gl.glUseProgram(self.prog)
+        gl.glUniform1f(self.uniforms["n"], ctypes.c_float(self.lut_size))
+        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(max(0.0, grain)))
+        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(0.6 if glow is not None else 0.0))
+        gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(w), ctypes.c_float(h))
+        bw, bh = block.size
+        tile = min(getattr(self, "maxt", 2048), 512)
+        out = Image.new("RGB", (bw, bh))
+        buf = ctypes.create_string_buffer(tile * tile * 4)
+        gl.glActiveTexture(GL_TEXTURE0)
+        gl.glBindTexture(GL_TEX2D, self.tex)
+        gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
+        gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
+        gl.glBindFramebuffer(GL_FBO, self.fb)
+        gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
+        gl.glPixelStorei(0x0CF5, 1)
+        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, tile, tile, 0, GL_RGB, GL_UBYTE, None)
+        for y in range(0, bh, tile):
+            rows = min(tile, bh - y)
+            for x in range(0, bw, tile):
+                cols = min(tile, bw - x)
+                if cols == tile and rows == tile:
+                    piece = block.crop((x, y, x + tile, y + tile))
+                else:
+                    piece = Image.new("RGB", (tile, tile))
+                    piece.paste(block.crop((x, y, x + cols, y + rows)), (0, 0))
+                raw = piece.tobytes()
+                gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, tile, tile, GL_RGB,
+                                   GL_UBYTE, ctypes.c_char_p(raw))
+                del piece
+                gl.glViewport(0, 0, tile, tile)
+                gl.glUniform2f(self.uniforms["blockSize"],
+                               ctypes.c_float(cols), ctypes.c_float(rows))
+                gl.glUniform2f(self.uniforms["uvScale"],
+                               ctypes.c_float(cols / tile), ctypes.c_float(rows / tile))
+                gl.glUniform2f(self.uniforms["blockOrigin"],
+                               ctypes.c_float(x), ctypes.c_float(top + y))
+                gl.glDrawArrays(GL_STRIP, 0, 4)
+                gl.glReadPixels(0, 0, tile, tile, GL_RGBA, GL_UBYTE, buf)
+                part = Image.frombytes("RGBA", (tile, tile), buf.raw[:tile * tile * 4])
+                part = part.convert("RGB").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                out.paste(part.crop((0, 0, cols, rows)), (x, y))
+                del part
+        return out
+
     def _upload_lut(self, cube_path):
         key = (cube_path, os.path.getmtime(cube_path))
         if key == self.lut_key:
@@ -1142,6 +1213,95 @@ def film_copy(image, cube_path, progress=None, gpu_budget=None):
     return result
 
 
+def _raw_prepare(original, workdir):
+    """Decode a JPEG to raw rgb24 (+ a 1/4 thumbnail) with ffmpeg.
+
+    Pillow would hold the whole 8 MP frame (24 MB) while the film copy needs
+    its own output buffer; going through a raw file keeps only the tile we are
+    working on resident.
+    """
+    raw = workdir / "input.raw"
+    small = workdir / "thumb.raw"
+    run_command(["ffmpeg", "-y", "-loglevel", "error", "-i", str(original),
+                 "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw)], timeout=120)
+    with Image.open(original) as handle:
+        w, h = handle.size
+    if not raw.exists() or raw.stat().st_size < w * h * 3:
+        return None
+    sw, sh = max(1, w // 4), max(1, h // 4)
+    try:
+        run_command(["ffmpeg", "-y", "-loglevel", "error", "-i", str(original),
+                     "-vf", "scale=%d:%d" % (sw, sh),
+                     "-f", "rawvideo", "-pix_fmt", "rgb24", str(small)], timeout=60)
+    except Exception:
+        return None
+    return raw, small, w, h, sw, sh
+
+
+def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None):
+    """Streaming film copy: per-tile reads from mmap, one output buffer."""
+    step = 512
+    out = Image.new("RGB", (w, h))
+    row = w * 3
+    with open(raw, "rb") as handle:
+        mm = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        with open(small, "rb") as sh_handle:
+            thumb = Image.frombuffer("RGB", (sw, sh), sh_handle.read(), "raw", "RGB", 0, 1)
+            glow = build_glow(thumb) if True else None
+        gpu = _gpu_ready(w * h)
+        done = 0
+        for top in range(0, h, step):
+            rows = min(step, h - top)
+            block = Image.frombuffer("RGB", (w, rows), mm[top * row:(top + rows) * row],
+                                     "raw", "RGB", 0, 1)
+            band = _render_band(block, top, w, h, cube_path, glow, gpu)
+            out.paste(band, (0, top))
+            done += rows
+            if progress:
+                progress(min(95, done * 95 // max(1, h)))
+        mm.close()
+    return out
+
+
+def _gpu_ready(pixels):
+    global _GPU, _GPU_STATE
+    if _ACCEL in ("cpu", "multi"):
+        return False
+    with _ACCEL_LOCK:
+        if _GPU_STATE == 0:
+            try:
+                _GPU = GpuFilm()
+                _GPU_STATE = 1
+                with camera_log() as log:
+                    log.write(("FilmBox accel: GPU (%s, max tex %d)\n"
+                               % (_GPU.renderer, _GPU.maxt)).encode())
+            except Exception as exc:
+                _GPU_STATE = 2
+                with camera_log() as log:
+                    log.write(("FilmBox accel: no GPU (%s)\n" % exc).encode())
+    return _GPU_STATE == 1 and pixels <= GPU_MAX_PIXELS
+
+
+def _render_band(block, top, w, h, cube_path, glow, use_gpu):
+    """One horizontal band of the film copy, sharing the glow texture."""
+    if use_gpu:
+        try:
+            return _GPU.apply_band(block, top, w, h, str(cube_path), glow, GRAIN_STRENGTH)
+        except Exception as exc:
+            with camera_log() as log:
+                log.write(("FilmBox accel: GPU band failed (%s)\n" % exc).encode())
+    lut = load_cube_lut(str(cube_path))
+    band = block.filter(lut)
+    if glow is not None:
+        sw, sh = glow.size
+        g0 = top * sh // h
+        g1 = min(sh, max(g0 + 1, (top + band.height) * sh // h))
+        piece = glow.crop((0, g0, sw, g1)).resize((w, band.height),
+                                                  Image.Resampling.NEAREST)
+        band = ImageChops.screen(band, piece)
+    return add_grain(band, GRAIN_STRENGTH, seed=top)
+
+
 def filtered_still(original, mode, progress=None, full_res=None):
     """Render the film copy. LUT work is tiled so an 8MP frame stays in RAM."""
     if mode == "NORMAL":
@@ -1153,6 +1313,31 @@ def filtered_still(original, mode, progress=None, full_res=None):
     # so measuring after it always looks "too tight" and silently falls back.
     gpu_budget = available_mb() - 24
     room_for_full = available_mb() >= 75
+    if (is_lut and want_full and room_for_full
+            and os.environ.get("FILMBOX_STREAM", "0") == "1"):
+        try:
+            with Image.open(original) as probe:
+                pw, ph = probe.size
+        except Exception:
+            pw = ph = 0
+        if pw * ph >= 3_000_000:
+            work = Path(tempfile.mkdtemp(prefix="filmbox-"))
+            try:
+                prep = _raw_prepare(original, work)
+                if prep is not None:
+                    result = film_copy_raw(*prep, LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube"),
+                                           progress)
+                    path = original.with_name(original.stem + "_" +
+                                              mode.replace(":", "-").lower() + ".jpg")
+                    result.save(path, quality=93, subsampling=1)
+                    if progress:
+                        progress(100)
+                    return path
+            except Exception as exc:
+                with camera_log() as log:
+                    log.write(("FilmBox stream failed: %s\n" % exc).encode())
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
     with Image.open(original) as handle:
         image = handle.convert("RGB")
         if is_lut:

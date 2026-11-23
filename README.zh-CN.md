@@ -139,6 +139,13 @@ selftest.py                相机层自检
 `filmbox diagnose` 会打印当前生效的引擎。GPU 与多核代码保留在 `filmbox.py` 里
 （可运行的原型在 `tools/gpu_lut.py`），以便在正常的驱动上再修。
 
+
+### 流式实验（默认关闭）
+
+`FILMBOX_STREAM=1` 会用 ffmpeg 把 JPEG 解成 raw 文件，再按 `mmap` 分带渲染。
+实测**更差**：20.9 秒 / 峰值 141MB，整图路径是 12.5 秒 / 129MB。
+现有管线本来就是 288 行条带处理，峰值已经没有余量可省，而 SD 卡来回读写比省下的更贵。
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。FilmBox 基于

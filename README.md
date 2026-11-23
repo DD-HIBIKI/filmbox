@@ -151,6 +151,15 @@ An 8 MP film copy is the expensive part. Measured on the Cardputer Zero
 is kept in `filmbox.py` (`tools/gpu_lut.py` holds the working prototype) so it
 can be fixed on drivers that behave.
 
+
+### Streaming experiment (off by default)
+
+`FILMBOX_STREAM=1` decodes the JPEG to a raw file with ffmpeg and renders the
+film copy band by band from `mmap`. Measured on the device it is **worse**:
+20.9 s / 141 MB peak vs 12.5 s / 129 MB for the normal path. The existing
+pipeline already works in 288-row strips, so there is no memory left to win,
+and the SD-card round trip costs more than it saves.
+
 ## License
 
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE). FilmBox is a fork of
