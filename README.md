@@ -144,7 +144,7 @@ An 8 MP film copy is the expensive part. Measured on the Cardputer Zero
 | Engine | 8 MP render | Status |
 |---|---|---|
 | `cpu` (default) | **5.1–6.5 s** | stable; Pillow `Color3DLUT` + integer grain |
-| `multi` | — | forks 4 workers; exhausts 512 MB and triggers the OOM killer, disabled by default |
+| `multi` | 2 MP: 1.55 s; 8 MP: not viable | forks 2 workers; at 8 MP the fork copy plus one Pillow buffer per worker triggers the OOM killer, so it is limited to ≤2.5 MP |
 | `gpu` | 0.77 s for the LUT round-trip in a standalone probe | the vc4 driver segfaults inside `glTexImage2D` once the renderer is driven from the app; experimental |
 
 `filmbox diagnose` prints which engine is active. The GPU and multi-core code

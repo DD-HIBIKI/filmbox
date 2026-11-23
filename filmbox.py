@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.6.3"
+VERSION = "0.6.5"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -984,8 +984,10 @@ def _band_finish(job):
 
 
 class MultiCoreFilm:
+    MIN_FREE_MB = 110      # below this, forking a second image copy is suicide
+
     def __init__(self, jobs=None):
-        self.jobs = jobs or min(4, os.cpu_count() or 1)
+        self.jobs = jobs or min(2, os.cpu_count() or 1)
 
     def apply(self, image, cube_path, halation=True, grain=5.0, lut_obj=None):
         if lut_obj is None:
@@ -993,8 +995,21 @@ class MultiCoreFilm:
             lut_obj = ImageFilter.Color3DLUT(size, [v / 255.0 for v in
                                                     struct.unpack("B" * (size ** 3 * 3), data)])
         import multiprocessing as mp
+        if available_mb() < self.MIN_FREE_MB:
+            with camera_log() as log:
+                log.write(("FilmBox accel: multi-core skipped, only %d MB free\n"
+                           % available_mb()).encode())
+            return None
         rgb = image if image.mode == "RGB" else image.convert("RGB")
         w, h = rgb.size
+        # 8 MP proved fatal even with two workers on this 352 MB board: the
+        # fork copy plus one Pillow buffer per worker tips it into the OOM
+        # killer. Multi-core is only used for the 2 MP fallback and below.
+        if w * h > 2_500_000:
+            with camera_log() as log:
+                log.write(("FilmBox accel: multi-core skipped for %.1f MP\n"
+                           % (w * h / 1e6)).encode())
+            return None
         jobs = max(1, min(self.jobs, h // 256))
         if jobs < 2:
             return None

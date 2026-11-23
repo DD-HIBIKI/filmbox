@@ -133,7 +133,7 @@ selftest.py                相机层自检
 | 引擎 | 8MP 出图 | 状态 |
 |---|---|---|
 | `cpu`（默认） | **5.1–6.5 秒** | 稳定，Pillow `Color3DLUT` + 整数颗粒 |
-| `multi` | — | fork 4 个进程，512MB 机器上直接 OOM，默认关闭 |
+| `multi` | 2MP：1.55 秒；8MP：不可行 | fork 2 个进程；8MP 时 fork 副本 + 每个进程一张 Pillow 缓冲就触发 OOM，因此限制在 ≤2.5MP |
 | `gpu` | 独立原型里 LUT 往返 0.77 秒 | 集成进应用后 vc4 驱动在 `glTexImage2D` 里段错误，实验性 |
 
 `filmbox diagnose` 会打印当前生效的引擎。GPU 与多核代码保留在 `filmbox.py` 里
