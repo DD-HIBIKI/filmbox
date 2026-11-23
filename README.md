@@ -145,7 +145,7 @@ An 8 MP film copy is the expensive part. Measured on the Cardputer Zero
 |---|---|---|
 | `cpu` (default) | **5.1–6.5 s** | stable; Pillow `Color3DLUT` + integer grain |
 | `multi` | 2 MP: 1.55 s; 8 MP: not viable | forks 2 workers; at 8 MP the fork copy plus one Pillow buffer per worker triggers the OOM killer, so it is limited to ≤2.5 MP |
-| `gpu` | 0.77 s for the LUT round-trip in a standalone probe | the vc4 driver segfaults inside `glTexImage2D` once the renderer is driven from the app; experimental |
+| `gpu` | 8 MP: **3.0–4.8 s** when ≥90 MB is free | EGL surfaceless + GLES2, tiled to 1024. The vc4 driver segfaults unless `mallopt(M_MMAP_THRESHOLD, 1 MB)` is set first — glibc's arena growth fragments what the driver expects. Falls back to CPU when memory is tight. |
 
 `filmbox diagnose` prints which engine is active. The GPU and multi-core code
 is kept in `filmbox.py` (`tools/gpu_lut.py` holds the working prototype) so it

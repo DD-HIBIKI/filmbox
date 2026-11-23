@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.6.5"
+VERSION = "0.6.9"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -744,11 +744,25 @@ void main(){
 }"""
 
 
+FS_SIMPLE = """#version 100
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D tex;
+void main(){ gl_FragColor = vec4(texture2D(tex, vUv).rgb, 1.0); }"""
+
+
 class GpuFilm:
     """Lazy EGL/GLES2 renderer. Construction raises on unsupported devices."""
 
     def __init__(self):
         os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+        try:
+            # Without this the vc4 driver segfaults inside glTexImage2D as soon
+            # as a Pillow image is resident: glibc's arena growth fragments the
+            # region the driver expects for its BOs.
+            ctypes.CDLL("libc.so.6").mallopt(-3, 1048576)  # M_MMAP_THRESHOLD
+        except Exception:
+            pass
         egl = ctypes.CDLL("libEGL.so.1")
         gl = ctypes.CDLL("libGLESv2.so.2")
         egl.eglGetDisplay.restype = ctypes.c_void_p
@@ -775,6 +789,7 @@ class GpuFilm:
         # wrong widths and the vc4 driver segfaults.
         u, i, f, v = ctypes.c_uint, ctypes.c_int, ctypes.c_float, ctypes.c_void_p
         gl.glTexImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
+        gl.glTexSubImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
         gl.glReadPixels.argtypes = [i, i, i, i, u, u, v]
         gl.glDrawArrays.argtypes = [u, i, i]
         gl.glViewport.argtypes = [i, i, i, i]
@@ -831,7 +846,8 @@ class GpuFilm:
 
         prog = gl.glCreateProgram()
         gl.glAttachShader(prog, shader(0x8B31, VS))
-        gl.glAttachShader(prog, shader(0x8B30, FS))
+        gl.glAttachShader(prog, shader(0x8B30,
+                                       FS_SIMPLE if os.environ.get("FB_SIMPLE_FS") else FS))
         gl.glLinkProgram(prog)
         status = ctypes.c_int()
         gl.glGetProgramiv(prog, 0x8B82, ctypes.byref(status))
@@ -856,6 +872,7 @@ class GpuFilm:
             gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
         for p in (GL_WRAP_S, GL_WRAP_T):
             gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+        gl.glPixelStorei(0x0CF5, 1)   # atlas rows are not 4-byte aligned
         gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, size * size, size, 0, GL_RGB,
                         GL_UBYTE, ctypes.c_char_p(self._atlas(size, data)))
         self.lut_key = key
@@ -884,6 +901,7 @@ class GpuFilm:
                 gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
             for p in (GL_WRAP_S, GL_WRAP_T):
                 gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+            gl.glPixelStorei(0x0CF5, 1)
             gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, glow.width, glow.height, 0,
                             GL_RGB, GL_UBYTE, ctypes.c_char_p(glow.tobytes()))
 
@@ -896,7 +914,7 @@ class GpuFilm:
         out = Image.new("RGB", (w, h))
         # 1024 tiles: a 2048 tile would hold 16 MB of read-back plus the crop,
         # which is enough to tip this 512 MB board into the OOM killer.
-        tile = min(getattr(self, "maxt", 2048), 1024)
+        tile = min(getattr(self, "maxt", 2048), 512)
         buf = ctypes.create_string_buffer(tile * tile * 4)
         gl.glActiveTexture(GL_TEXTURE0)
         gl.glBindTexture(GL_TEX2D, self.tex)
@@ -904,6 +922,10 @@ class GpuFilm:
         gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
         gl.glBindFramebuffer(GL_FBO, self.fb)
         gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
+        gl.glPixelStorei(0x0CF5, 1)                       # GL_UNPACK_ALIGNMENT
+        # Allocate the tile ONCE: re-specifying it per tile leaks driver BOs
+        # until the 38 MB of CMA is gone, then vc4 segfaults.
+        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, tile, tile, 0, GL_RGB, GL_UBYTE, None)
         for top in range(0, h, tile):
             rows = min(tile, h - top)
             for left in range(0, w, tile):
@@ -916,13 +938,9 @@ class GpuFilm:
                     block = Image.new("RGB", (tile, tile))
                     block.paste(rgb.crop((left, top, left + cols, top + rows)), (0, 0))
                 raw = block.tobytes()
-                gl.glPixelStorei(0x0CF5, 1)    # GL_UNPACK_ALIGNMENT
-                gl.glBindFramebuffer(GL_FBO, 0)
-                gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, tile, tile, 0, GL_RGB,
-                                GL_UBYTE, ctypes.c_char_p(raw))
+                gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, tile, tile, GL_RGB,
+                                   GL_UBYTE, ctypes.c_char_p(raw))
                 del block
-                gl.glBindFramebuffer(GL_FBO, self.fb)
-                gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
                 gl.glViewport(0, 0, tile, tile)
                 gl.glUniform2f(self.uniforms["blockSize"],
                                ctypes.c_float(cols), ctypes.c_float(rows))
@@ -1057,7 +1075,9 @@ def _accel_status():
 
 
 GRAIN_STRENGTH = 5.0
-_ACCEL = os.environ.get("FILMBOX_ACCEL", "cpu").strip().lower()
+GPU_MAX_PIXELS = 8_500_000
+GPU_MIN_FREE_MB = 90
+_ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
@@ -1083,7 +1103,8 @@ def film_copy(image, cube_path, progress=None):
                     _GPU_STATE = 2
                     with camera_log() as log:
                         log.write(("FilmBox accel: no GPU (%s)\n" % exc).encode())
-        if _GPU_STATE == 1:
+        if (_GPU_STATE == 1 and image.width * image.height <= GPU_MAX_PIXELS
+                and available_mb() >= GPU_MIN_FREE_MB):
             try:
                 out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH)
                 if progress:

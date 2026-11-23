@@ -21,7 +21,7 @@ shutil.copy2(project / 'src/filmbox.py', root / 'usr/lib/filmbox/filmbox.py')
 (root / 'usr/bin/filmbox').write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/lib/filmbox/filmbox.py "$@"\n')
 (root / 'usr/bin/filmbox').chmod(0o755)
 (root / 'DEBIAN/control').write_text('''Package: filmbox
-Version: 0.6.5
+Version: 0.6.7
 Section: graphics
 Priority: optional
 Architecture: all
@@ -67,6 +67,6 @@ for folder in root.rglob('*'):
         folder.chmod(0o755)
 (root / 'DEBIAN').chmod(0o755)
 (root / 'DEBIAN/control').chmod(0o644)
-output = project.parent / 'filmbox_0.6.5_all.deb'
+output = project.parent / 'filmbox_0.6.7_all.deb'
 subprocess.run(['dpkg-deb', '--build', '--root-owner-group', str(root), str(output)], check=True)
 print(output)
