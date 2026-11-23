@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -705,13 +705,15 @@ uniform vec2 imgSize;
 uniform float n;             // LUT edge (13 or 33)
 uniform float grainAmp;      // grey levels
 uniform float glowMix;       // 0 disables halation
+uniform vec2 uvScale;        // tile content vs padded texture
 
 float hash(vec2 p){
   return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
 void main(){
-  vec3 c = texture2D(tex, vUv).rgb;
+  vec2 uv = vUv * uvScale;
+  vec3 c = texture2D(tex, uv).rgb;
 
   // 3D LUT from a 2D atlas: x = b*n + r, y = g
   float b = clamp(c.b, 0.0, 1.0) * (n - 1.0);
@@ -725,14 +727,14 @@ void main(){
 
   // halation: screen with a 1/4-scale glow texture
   if (glowMix > 0.0) {
-    vec2 g = (blockOrigin + vUv * blockSize) / imgSize;
+    vec2 g = (blockOrigin + uv * blockSize) / imgSize;
     vec3 gl = texture2D(glow, g).rgb * glowMix;
     col = 1.0 - (1.0 - col) * (1.0 - gl);
   }
 
   // grain: full-image pixel coordinates keep tiles seamless
   if (grainAmp > 0.0) {
-    vec2 px = blockOrigin + vUv * blockSize;
+    vec2 px = blockOrigin + uv * blockSize;
     float n1 = hash(px) + hash(px + vec2(17.0, 31.0)) - 1.0;   // ±1
     float luma = dot(col, vec3(0.299, 0.587, 0.114));
     float w = clamp(1.35 - luma * 1.5, 0.15, 1.0);
@@ -769,6 +771,24 @@ class GpuFilm:
         if not egl.eglMakeCurrent(dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), ctx):
             raise RuntimeError("eglMakeCurrent")
         self.egl, self.gl = egl, gl
+        # Without explicit signatures ctypes passes Python ints/floats with the
+        # wrong widths and the vc4 driver segfaults.
+        u, i, f, v = ctypes.c_uint, ctypes.c_int, ctypes.c_float, ctypes.c_void_p
+        gl.glTexImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
+        gl.glReadPixels.argtypes = [i, i, i, i, u, u, v]
+        gl.glDrawArrays.argtypes = [u, i, i]
+        gl.glViewport.argtypes = [i, i, i, i]
+        gl.glBindTexture.argtypes = [u, u]
+        gl.glBindFramebuffer.argtypes = [u, u]
+        gl.glFramebufferTexture2D.argtypes = [u, u, u, u, i]
+        gl.glTexParameteri.argtypes = [u, u, i]
+        gl.glPixelStorei.argtypes = [u, i]
+        gl.glActiveTexture.argtypes = [u]
+        gl.glUniform1i.argtypes = [i, i]
+        gl.glUniform1f.argtypes = [i, f]
+        gl.glUniform2f.argtypes = [i, f, f]
+        gl.glGetUniformLocation.argtypes = [u, ctypes.c_char_p]
+        gl.glGetUniformLocation.restype = i
         maxt = ctypes.c_int()
         gl.glGetIntegerv(0x0D33, ctypes.byref(maxt))
         self.maxt = maxt.value or 2048
@@ -781,7 +801,7 @@ class GpuFilm:
         gl.glGenFramebuffers(1, ctypes.byref(self.fb))
         self.uniforms = {}
         for name in (b"tex", b"lut", b"glow", b"blockSize", b"blockOrigin",
-                     b"imgSize", b"n", b"grainAmp", b"glowMix"):
+                     b"imgSize", b"n", b"grainAmp", b"glowMix", b"uvScale"):
             self.uniforms[name.decode()] = gl.glGetUniformLocation(self.prog, name)
         quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
         self._quad = quad
@@ -874,30 +894,50 @@ class GpuFilm:
         gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(w), ctypes.c_float(h))
 
         out = Image.new("RGB", (w, h))
-        tile = min(self.maxt, 2048)
+        # 1024 tiles: a 2048 tile would hold 16 MB of read-back plus the crop,
+        # which is enough to tip this 512 MB board into the OOM killer.
+        tile = min(getattr(self, "maxt", 2048), 1024)
+        buf = ctypes.create_string_buffer(tile * tile * 4)
+        gl.glActiveTexture(GL_TEXTURE0)
+        gl.glBindTexture(GL_TEX2D, self.tex)
+        gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
+        gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
+        gl.glBindFramebuffer(GL_FBO, self.fb)
+        gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
         for top in range(0, h, tile):
             rows = min(tile, h - top)
             for left in range(0, w, tile):
                 cols = min(tile, w - left)
-                block = rgb.crop((left, top, left + cols, top + rows))
-                gl.glActiveTexture(GL_TEXTURE0)
-                gl.glBindTexture(GL_TEX2D, self.tex)
-                gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
-                gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
-                gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, cols, rows, 0, GL_RGB,
-                                GL_UBYTE, ctypes.c_char_p(block.tobytes()))
+                if cols == tile and rows == tile:
+                    block = rgb.crop((left, top, left + tile, top + tile))
+                else:
+                    # vc4 segfaults when a texture is re-specified at a different
+                    # size, so pad every edge tile to the full tile size.
+                    block = Image.new("RGB", (tile, tile))
+                    block.paste(rgb.crop((left, top, left + cols, top + rows)), (0, 0))
+                raw = block.tobytes()
+                gl.glPixelStorei(0x0CF5, 1)    # GL_UNPACK_ALIGNMENT
+                gl.glBindFramebuffer(GL_FBO, 0)
+                gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, tile, tile, 0, GL_RGB,
+                                GL_UBYTE, ctypes.c_char_p(raw))
+                del block
                 gl.glBindFramebuffer(GL_FBO, self.fb)
                 gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
-                gl.glViewport(0, 0, cols, rows)
+                gl.glViewport(0, 0, tile, tile)
                 gl.glUniform2f(self.uniforms["blockSize"],
                                ctypes.c_float(cols), ctypes.c_float(rows))
+                gl.glUniform2f(self.uniforms["uvScale"],
+                               ctypes.c_float(cols / tile), ctypes.c_float(rows / tile))
                 gl.glUniform2f(self.uniforms["blockOrigin"],
                                ctypes.c_float(left), ctypes.c_float(top))
                 gl.glDrawArrays(GL_STRIP, 0, 4)
-                buf = ctypes.create_string_buffer(cols * rows * 4)
-                gl.glReadPixels(0, 0, cols, rows, GL_RGBA, GL_UBYTE, buf)
-                part = Image.frombytes("RGBA", (cols, rows), buf.raw).convert("RGB")
-                out.paste(part.transpose(Image.Transpose.FLIP_TOP_BOTTOM), (left, top))
+                gl.glReadPixels(0, 0, tile, tile, GL_RGBA, GL_UBYTE, buf)
+                # frombuffer proved to segfault on this Mesa build; frombytes copies
+                # 3 MB per tile, which is cheap next to a crash.
+                part = Image.frombytes("RGBA", (tile, tile), buf.raw[:tile * tile * 4])
+                part = part.convert("RGB").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                out.paste(part.crop((0, 0, cols, rows)), (left, top))
+                del part
         return out
 
 
@@ -1002,7 +1042,7 @@ def _accel_status():
 
 
 GRAIN_STRENGTH = 5.0
-_ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
+_ACCEL = os.environ.get("FILMBOX_ACCEL", "cpu").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable

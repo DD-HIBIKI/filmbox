@@ -138,22 +138,18 @@ selftest.py             camera-layer self test
 
 ## Performance
 
-Rendering an 8 MP film copy is the expensive part; three engines are tried in
-order and the best available wins:
+An 8 MP film copy is the expensive part. Measured on the Cardputer Zero
+(aarch64, 512 MB, `FILMBOX_ACCEL` selects the engine):
 
-| Engine | How | 8 MP render |
+| Engine | 8 MP render | Status |
 |---|---|---|
-| GPU | EGL surfaceless + GLES2 fragment shader (3D LUT, halation, grain in one pass, tiled to the driver's max texture size) | fastest |
-| Multi-core | `fork` 2–4 workers, each takes a band | ~3× faster than one core |
-| Single core | Pillow `Color3DLUT` + numpy grain | baseline, always works |
+| `cpu` (default) | **5.1–6.5 s** | stable; Pillow `Color3DLUT` + integer grain |
+| `multi` | — | forks 4 workers; exhausts 512 MB and triggers the OOM killer, disabled by default |
+| `gpu` | 0.77 s for the LUT round-trip in a standalone probe | the vc4 driver segfaults inside `glTexImage2D` once the renderer is driven from the app; experimental |
 
-```bash
-FILMBOX_ACCEL=auto    # default: GPU → multi-core → single core
-FILMBOX_ACCEL=gpu     # force GPU (falls back if unavailable)
-FILMBOX_ACCEL=multi   # skip the GPU
-FILMBOX_ACCEL=cpu     # single-threaded, easiest to debug
-filmbox diagnose      # prints which engine is active
-```
+`filmbox diagnose` prints which engine is active. The GPU and multi-core code
+is kept in `filmbox.py` (`tools/gpu_lut.py` holds the working prototype) so it
+can be fixed on drivers that behave.
 
 ## License
 

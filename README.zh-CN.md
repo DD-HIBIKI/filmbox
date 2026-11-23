@@ -128,21 +128,16 @@ selftest.py                相机层自检
 
 ## 性能
 
-8MP 胶片副本是整个流程里最贵的一步，代码会按顺序尝试三种引擎，用可用的最快的那个：
+8MP 胶片副本是整个流程里最贵的一步。在 Cardputer Zero 上实测（aarch64 / 512MB，用 `FILMBOX_ACCEL` 选引擎）：
 
-| 引擎 | 做法 | 8MP 出图 |
+| 引擎 | 8MP 出图 | 状态 |
 |---|---|---|
-| GPU | EGL 无窗口 + GLES2 片元着色器，一次 pass 完成 LUT、光晕、颗粒（按驱动纹理上限分块） | 最快 |
-| 多核 | `fork` 2–4 个进程，各处理一条横带 | 比单核快约 3 倍 |
-| 单核 | Pillow `Color3DLUT` + numpy 颗粒 | 兜底，任何环境都能跑 |
+| `cpu`（默认） | **5.1–6.5 秒** | 稳定，Pillow `Color3DLUT` + 整数颗粒 |
+| `multi` | — | fork 4 个进程，512MB 机器上直接 OOM，默认关闭 |
+| `gpu` | 独立原型里 LUT 往返 0.77 秒 | 集成进应用后 vc4 驱动在 `glTexImage2D` 里段错误，实验性 |
 
-```bash
-FILMBOX_ACCEL=auto    # 默认：GPU → 多核 → 单核
-FILMBOX_ACCEL=gpu     # 强制 GPU（不可用会自动降级）
-FILMBOX_ACCEL=multi   # 不走 GPU
-FILMBOX_ACCEL=cpu     # 单线程，便于排查
-filmbox diagnose      # 打印当前生效的引擎
-```
+`filmbox diagnose` 会打印当前生效的引擎。GPU 与多核代码保留在 `filmbox.py` 里
+（可运行的原型在 `tools/gpu_lut.py`），以便在正常的驱动上再修。
 
 ## 许可
 
