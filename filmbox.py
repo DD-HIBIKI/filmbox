@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.7.8"
+VERSION = "0.8.2"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -1322,7 +1322,7 @@ def filtered_still(original, mode, progress=None, full_res=None):
     gpu_budget = available_mb() - 24
     # Measured peak for an 8 MP film copy is ~143 MB RSS, so only go full-res
     # with real headroom; otherwise the allocation fails and the user sees ERR.
-    room_for_full = available_mb() >= 145
+    room_for_full = available_mb() >= 130
     if (is_lut and want_full and room_for_full
             and os.environ.get("FILMBOX_STREAM", "0") == "1"):
         try:
@@ -2949,6 +2949,25 @@ def draw_help(width=320, height=170):
     return image
 
 
+def draw_film_overlay(percent, label="", width=320, height=170):
+    """Full-screen film-copy screen: the viewfinder is frozen while rendering."""
+    image = Image.new("RGB", (width, height), (6, 10, 16))
+    d = ImageDraw.Draw(image)
+    d.text((10, 10), "FILM COPY", font=font(12, True), fill=MINT)
+    if label:
+        d.text((10, 28), label[:34], font=font(9), fill=(170, 196, 208))
+    bar_x, bar_y, bar_w = 10, 62, width - 20
+    d.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + 12), 6,
+                        fill=(22, 32, 44), outline=(40, 62, 74), width=1)
+    filled = max(0, min(100, percent)) * bar_w // 100
+    if filled:
+        d.rounded_rectangle((bar_x, bar_y, bar_x + filled, bar_y + 12), 6, fill=MINT)
+    d.text((10, 84), "%d%%" % percent, font=font(16, True), fill=PAPER)
+    d.text((10, height - 26), "viewfinder frozen - this keeps the 8MP copy", font=font(7),
+           fill=(120, 146, 160))
+    return image
+
+
 def draw_ui(scene, mode="PHOTO", style="NORMAL", resolution="8MP", status="READY",
             sound=True, recording_seconds=0, width=320, height=170, fps=0, clean=False,
             zoom=None):
@@ -3091,6 +3110,8 @@ class FilmBoxUI:
         self._cam_error_seen = None
         self._cam_err_streak = 0
         self._cam_ok_streak = 0
+        self.film_progress = None
+        self.film_label = ""
         self._settings_dirty = False
         self._settings_flushed = 0.0
         self.frame_counter = 0
@@ -3133,23 +3154,50 @@ class FilmBoxUI:
             self.set_status("FILM BUSY - ONE AT A TIME", 4)
             return
         self.film_busy = True
+        was_live = bool(getattr(self.stream, "running", False))
+        want = RESOLUTION_LABELS[self.settings.get("resolution", 0)]
+        # The viewfinder is about to be frozen, which frees ~16 MB, so a frame
+        # that looks tight right now may still make full resolution.
+        tight = available_mb() < 130 and self.settings.get("resolution", 0) == 0
+        label = (look.replace(LUT_PREFIX, "") + "  " + want +
+                 ("  (LOW MEM -> 2MP)" if tight else ""))
+        self.film_progress = 0
+        self.film_label = label
+
+        def on_progress(percent):
+            self.film_progress = max(0, min(100, percent))
 
         def render():
             try:
+                if was_live:
+                    # Freezing the viewfinder gives the render ~14 % more CPU and
+                    # about 16 MB of RAM, which is what lets 8 MP succeed.
+                    try:
+                        self.stream.stop()
+                    except Exception:
+                        pass
+                output_path = filtered_still(original, look, progress=on_progress,
+                                             full_res=self.settings.get("lut_full_res", False))
+                output_name = output_path.name if output_path is not None else ""
                 try:
-                    os.nice(10)          # keep the viewfinder responsive
-                except OSError:
-                    pass
-                filtered_still(original, look,
-                               progress=lambda p: self.set_status(f"FILM {p}%", 30),
-                               full_res=self.settings.get("lut_full_res", False))
-                self.set_status("SAVED " + original.name[:18] + " +FILM", 5)
+                    with Image.open(original.with_name(output_name)) as probe:
+                        pixels = probe.width * probe.height
+                except Exception:
+                    pixels = 0
+                size_tag = ("%dMP" % round(pixels / 1e6)) if pixels else "FILM"
+                self.set_status("SAVED +FILM " + size_tag, 5)
             except Exception as exc:
                 with camera_log() as log:
                     log.write(f"FilmBox film error: {type(exc).__name__}: {exc}\n".encode())
                 self.set_status("FILM ERR " + str(exc)[:26], 10)
             finally:
+                self.film_progress = None
                 self.film_busy = False
+                if was_live:
+                    try:
+                        self.stream.start()
+                    except Exception:
+                        pass
         threading.Thread(target=render, daemon=True).start()
 
     def do_photo(self):
@@ -3648,6 +3696,12 @@ class FilmBoxUI:
                              if mode == "PHOTO" else "15F/2S")
                 elapsed = int(now - self.recording.started) if self.recording and self.recording.started else 0
                 live_status = "REC" if self.recording is not None else self.status
+                if self.film_progress is not None:
+                    frame_image = draw_film_overlay(self.film_progress, self.film_label,
+                                                    width=self.display.w, height=self.display.h)
+                    self.safe_draw(frame_image, "film")
+                    time.sleep(0.08)
+                    continue
                 frame_image = draw_ui(scene, mode, style, label,
                         live_status, self.settings["sound"], elapsed,
                         width=self.display.w, height=self.display.h, fps=self.fps,
