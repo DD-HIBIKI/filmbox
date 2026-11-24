@@ -1185,9 +1185,9 @@ def _accel_status():
 
 
 GRAIN_STRENGTH = 5.0
-GPU_MAX_PIXELS = 5_000_000
-GPU_MIN_FREE_MB = 80
-_ACCEL = os.environ.get("FILMBOX_ACCEL", "cpu").strip().lower()
+GPU_MAX_PIXELS = 8_500_000
+GPU_MIN_FREE_MB = 70
+_ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
@@ -3753,7 +3753,23 @@ class FilmBoxUI:
             self.touch_settings()
             click(self.settings["sound"])
 
+    def _warm_gpu(self):
+        """Initialise EGL in the background so the first shot is not slow."""
+        try:
+            _gpu_ready(1, max(available_mb(), 200))
+        except Exception:
+            pass
+
     def run(self, gallery_only=False):
+        # EGL contexts cannot be created from a worker thread on this driver, so
+        # initialise once here (2.7 s at startup); every later render happens on
+        # a worker thread that only has to make the context current.
+        if _ACCEL in ("auto", "gpu") and not gallery_only:
+            try:
+                _gpu_ready(1, max(available_mb(), 200))
+            except Exception:
+                pass
+
         def _shutdown(signum, frame):
             self.running = False
 
