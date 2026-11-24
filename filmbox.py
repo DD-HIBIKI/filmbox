@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FilmBox 0.8.6 — film-simulation camera for M5Stack Cardputer Zero.
+"""FilmBox 0.9.0 — film-simulation camera for M5Stack Cardputer Zero.
 
 Fork of CyberCam 0.5.3 by Cybern0mads (MIT).  Adds Picamera2 single-session
 camera control, 18 film LUTs, 4-step zoom, full-bleed viewfinder and a
@@ -21,6 +21,7 @@ import mimetypes
 import secrets
 import tempfile
 import urllib.parse
+import weakref
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import lru_cache
@@ -848,6 +849,8 @@ class GpuFilm:
         self.dpy, self.ctx = dpy, ctx
         try:
             u, i, f, v = ctypes.c_uint, ctypes.c_int, ctypes.c_float, ctypes.c_void_p
+            gl.glGenTextures.argtypes = [i, ctypes.POINTER(u)]
+            gl.glDeleteTextures.argtypes = [i, ctypes.POINTER(u)]
             gl.glTexImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
             gl.glTexSubImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
             gl.glReadPixels.argtypes = [i, i, i, i, u, u, v]
@@ -874,6 +877,10 @@ class GpuFilm:
             self.prog = self._program()
             self.lut_tex = None
             self.lut_key = None
+            self._lut_alloc_size = None
+            self.glow_tex = None
+            self._glow_ref = None
+            self._glow_alloc_size = None
             self.src_tex, self.dst_tex, self.fb = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
             gl.glGenTextures(1, ctypes.byref(self.src_tex))
             gl.glGenTextures(1, ctypes.byref(self.dst_tex))
@@ -957,22 +964,30 @@ class GpuFilm:
         gl = self.gl
         if glow is None:
             return
-        key = (id(glow), glow.size)
-        if getattr(self, "_glow_key", None) == key:
+        if self._glow_ref is not None and self._glow_ref() is glow:
             return
-        if not hasattr(self, "glow_tex"):
+        size_wh = (glow.width, glow.height)
+        raw = glow.tobytes()
+        gl.glActiveTexture(GL_TEXTURE2)
+        gl.glPixelStorei(0x0CF5, 1)
+        if self.glow_tex is not None and self._glow_alloc_size == size_wh:
+            gl.glBindTexture(GL_TEX2D, self.glow_tex)
+            gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, size_wh[0], size_wh[1],
+                               GL_RGB, GL_UBYTE, ctypes.c_char_p(raw))
+        else:
+            if self.glow_tex is not None:
+                gl.glDeleteTextures(1, ctypes.byref(self.glow_tex))
             self.glow_tex = ctypes.c_uint()
             gl.glGenTextures(1, ctypes.byref(self.glow_tex))
-        gl.glActiveTexture(GL_TEXTURE2)
-        gl.glBindTexture(GL_TEX2D, self.glow_tex)
-        for p in (GL_MIN_F, GL_MAG_F):
-            gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
-        for p in (GL_WRAP_S, GL_WRAP_T):
-            gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
-        gl.glPixelStorei(0x0CF5, 1)
-        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, glow.width, glow.height, 0,
-                        GL_RGB, GL_UBYTE, ctypes.c_char_p(glow.tobytes()))
-        self._glow_key = key
+            gl.glBindTexture(GL_TEX2D, self.glow_tex)
+            for p in (GL_MIN_F, GL_MAG_F):
+                gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
+            for p in (GL_WRAP_S, GL_WRAP_T):
+                gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+            gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, size_wh[0], size_wh[1], 0,
+                            GL_RGB, GL_UBYTE, ctypes.c_char_p(raw))
+            self._glow_alloc_size = size_wh
+        self._glow_ref = weakref.ref(glow)
 
     def apply_band(self, block, top, w, h, cube_path, glow, grain=5.0):
         """Render one horizontal band with the shared LUT and glow textures."""
@@ -983,7 +998,8 @@ class GpuFilm:
             finally:
                 self._release_current()
 
-    def _render_tiles(self, rgb, origin_top, full_w, full_h, cube_path, glow, grain):
+    def _render_tiles(self, rgb, origin_top, full_w, full_h, cube_path, glow, grain,
+                      progress=None, inplace=False):
         self._upload_lut(cube_path)
         self._upload_glow(glow)
         gl = self.gl
@@ -1001,8 +1017,10 @@ class GpuFilm:
         gl.glActiveTexture(GL_TEXTURE0)
         gl.glBindTexture(GL_TEX2D, self.src_tex)
         gl.glPixelStorei(0x0CF5, 1)
-        out = Image.new("RGB", (bw, bh))
+        out = rgb if inplace else Image.new("RGB", (bw, bh))
         buf = ctypes.create_string_buffer(tile * tile * 4)
+        total_tiles = max(1, ((bh + tile - 1) // tile) * ((bw + tile - 1) // tile))
+        done_tiles = 0
         for y in range(0, bh, tile):
             rows = min(tile, bh - y)
             for x in range(0, bw, tile):
@@ -1022,6 +1040,9 @@ class GpuFilm:
                 gl.glReadPixels(0, 0, cols, rows, GL_RGBA, GL_UBYTE, buf)
                 part = Image.frombytes("RGBA", (cols, rows), buf.raw[:cols * rows * 4]).convert("RGB")
                 out.paste(part, (x, y))
+                done_tiles += 1
+                if progress is not None:
+                    progress(min(90, 8 + done_tiles * 82 // total_tiles))
         return out
 
     def _upload_lut(self, cube_path):
@@ -1029,19 +1050,28 @@ class GpuFilm:
         if key == self.lut_key:
             return
         size, data, _ = read_cube(cube_path)
+        atlas = self._atlas(size, data)
+        size_wh = (size * size, size)
         gl = self.gl
-        if self.lut_tex is None:
+        gl.glActiveTexture(GL_TEXTURE1)
+        gl.glPixelStorei(0x0CF5, 1)   # atlas rows are not 4-byte aligned
+        if self.lut_tex is not None and self._lut_alloc_size == size_wh:
+            gl.glBindTexture(GL_TEX2D, self.lut_tex)
+            gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, size_wh[0], size_wh[1],
+                               GL_RGB, GL_UBYTE, ctypes.c_char_p(atlas))
+        else:
+            if self.lut_tex is not None:
+                gl.glDeleteTextures(1, ctypes.byref(self.lut_tex))
             self.lut_tex = ctypes.c_uint()
             gl.glGenTextures(1, ctypes.byref(self.lut_tex))
-        gl.glActiveTexture(GL_TEXTURE1)
-        gl.glBindTexture(GL_TEX2D, self.lut_tex)
-        for p in (GL_MIN_F, GL_MAG_F):
-            gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
-        for p in (GL_WRAP_S, GL_WRAP_T):
-            gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
-        gl.glPixelStorei(0x0CF5, 1)   # atlas rows are not 4-byte aligned
-        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, size * size, size, 0, GL_RGB,
-                        GL_UBYTE, ctypes.c_char_p(self._atlas(size, data)))
+            gl.glBindTexture(GL_TEX2D, self.lut_tex)
+            for p in (GL_MIN_F, GL_MAG_F):
+                gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
+            for p in (GL_WRAP_S, GL_WRAP_T):
+                gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+            gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, size_wh[0], size_wh[1], 0, GL_RGB,
+                            GL_UBYTE, ctypes.c_char_p(atlas))
+            self._lut_alloc_size = size_wh
         self.lut_key = key
         self.lut_size = float(size)
 
@@ -1052,7 +1082,7 @@ class GpuFilm:
         arr = np.frombuffer(data, dtype=np.uint8).reshape(size, size, size, 3)
         return np.ascontiguousarray(arr.transpose(1, 0, 2, 3).reshape(size, size * size, 3)).tobytes()
 
-    def apply(self, image, cube_path, halation=True, grain=5.0):
+    def apply(self, image, cube_path, halation=True, grain=5.0, progress=None):
         rgb = image if image.mode == "RGB" else image.convert("RGB")
         w, h = rgb.size
         glow = None
@@ -1061,11 +1091,16 @@ class GpuFilm:
             sw, sh = max(1, w // 4), max(1, h // 4)
             small_graded = rgb.resize((sw, sh), Image.Resampling.BOX).filter(load_cube_lut(str(cube_path)))
             glow = build_glow(small_graded, monochrome=mono)
+            del small_graded
+        if progress is not None:
+            progress(8)
         with _ACCEL_LOCK:
             self._make_current()
             try:
-                return self._render_tiles(rgb, 0, w, h, cube_path, glow, grain)
+                return self._render_tiles(rgb, 0, w, h, cube_path, glow, grain,
+                                          progress=progress, inplace=True)
             finally:
+                self._glow_ref = None
                 self._release_current()
 
 
@@ -1203,7 +1238,7 @@ def film_copy(image, cube_path, progress=None, gpu_budget=None):
     free_now = available_mb() if gpu_budget is None else gpu_budget
     if _gpu_ready(image.width * image.height, free_now):
         try:
-            out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH)
+            out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH, progress=progress)
             if progress:
                 progress(90)
             return out
@@ -1296,15 +1331,16 @@ def _gpu_ready(pixels, free_mb=None):
     global _GPU, _GPU_STATE
     if _ACCEL in ("cpu", "multi"):
         return False
-    # Refuse BEFORE touching EGL: GpuFilm.__init__ calls mallopt(), which slows
-    # every later Pillow allocation in this process. Initialising it for a frame
-    # that will not use the GPU costs ~2.4 s on an 8 MP render.
     if pixels > GPU_MAX_PIXELS:
         return False
     if free_mb is not None and free_mb < GPU_MIN_FREE_MB:
         return False
     with _ACCEL_LOCK:
         if _GPU_STATE == 0:
+            # Mesa/vc4 requires EGL context creation on the main thread; never
+            # call GpuFilm() lazily from a worker thread.
+            if threading.current_thread() is not threading.main_thread():
+                return False
             try:
                 _GPU = GpuFilm()
                 _GPU_STATE = 1
@@ -1360,14 +1396,11 @@ def filtered_still(original, mode, progress=None, full_res=None):
         return None
     is_lut = mode.startswith(LUT_PREFIX)
     cube_file = resolve_lut_path(mode[len(LUT_PREFIX):]) if is_lut else None
-    # Measure free RAM *before* decoding: an 8MP RGB copy alone eats ~24 MB.
+    # Measure free RAM *before* decoding: an 8MP RGB copy eats ~24 MB (2MP eats ~6 MB).
     want_full = LUT_FULL_RES if full_res is None else bool(full_res)
-    # Decide the GPU budget before decoding: an 8 MP RGB decode costs ~24 MB,
-    # so measuring after it always looks "too tight" and silently falls back.
-    gpu_budget = available_mb() - 24
-    # Measured peak for an 8 MP film copy is ~143 MB RSS, so only go full-res
-    # with real headroom; otherwise the allocation fails and the user sees ERR.
     room_for_full = available_mb() >= 130
+    decode_mb = 24 if (want_full and room_for_full) else 6
+    gpu_budget = available_mb() - decode_mb
     if (is_lut and want_full and room_for_full
             and os.environ.get("FILMBOX_STREAM", "0") == "1"):
         try:
@@ -3753,23 +3786,7 @@ class FilmBoxUI:
             self.touch_settings()
             click(self.settings["sound"])
 
-    def _warm_gpu(self):
-        """Initialise EGL in the background so the first shot is not slow."""
-        try:
-            _gpu_ready(1, max(available_mb(), 200))
-        except Exception:
-            pass
-
     def run(self, gallery_only=False):
-        # EGL contexts cannot be created from a worker thread on this driver, so
-        # initialise once here (2.7 s at startup); every later render happens on
-        # a worker thread that only has to make the context current.
-        if _ACCEL in ("auto", "gpu") and not gallery_only:
-            try:
-                _gpu_ready(1, max(available_mb(), 200))
-            except Exception:
-                pass
-
         def _shutdown(signum, frame):
             self.running = False
 
@@ -3786,7 +3803,21 @@ class FilmBoxUI:
             if gallery_only:
                 self.gallery = Gallery()
             else:
+                # Light up the LCD immediately (<50 ms), then start the camera so
+                # sensor/ISP warm-up runs concurrently with main-thread EGL setup.
+                self.safe_draw(draw_ui(
+                    None, self.mode, self.settings["filter"],
+                    RESOLUTION_LABELS[self.settings["resolution"]],
+                    "STARTING CAMERA", self.settings["sound"], 0,
+                    width=self.display.w, height=self.display.h, fps=0,
+                    clean=self.settings.get("clean_ui", False),
+                    zoom=self.settings.get("zoom", 1.0)), "boot")
                 self.stream.start()
+                if _ACCEL in ("auto", "gpu"):
+                    try:
+                        _gpu_ready(1, max(available_mb(), 200))
+                    except Exception:
+                        pass
             last_draw = 0.0
             last_status = None
             while self.running:
@@ -4048,6 +4079,11 @@ def main(argv=None):
             serve_gallery(bind=args.bind, port=args.port)
             return 0
         if args.command == "photo":
+            if _ACCEL in ("auto", "gpu") and args.filter.startswith(LUT_PREFIX):
+                try:
+                    _gpu_ready(1, max(available_mb(), 200))
+                except Exception:
+                    pass
             dims = tuple(map(int, args.resolution.split("x")))
             full_res = settings.get("lut_full_res", True) if args.lut_full is None else (args.lut_full == "on")
             original, filtered = take_photo(args.filter, dims, not args.no_sound, rotation, full_res=full_res)

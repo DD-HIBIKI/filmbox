@@ -51,3 +51,17 @@
 | **P3-1** | `filmbox.py` (`read_cube` / `_LUT_CACHE`) | `read_cube` 与 `_CUBE_CACHE` 重复定义两遍；`_LUT_CACHE` 无上限，浏览全部 LUT 后常驻约 8–10 MB。 | 删除重复定义；对 `_LUT_CACHE` 与 `_CUBE_CACHE` 做容量上限淘汰（保留最近 4 支）。 |
 | **P3-2** | `filmbox.py` (`LookPicker` / `available_luts`) | ① `open_picker()` 先补黑边再套滤镜再裁切，且运行时新拷入的 `.cube` 不刷新；② `label()` 未剥离 `look_` 前缀，显示 `LUT look classic neg`。 | 动态扫描用户与系统 LUT 目录；预览图直接按预览窗比例 `fill_size` 裁好再套滤镜（省约 40% 像素开销且无黑边干扰）；剥离 `look_` 前缀。 |
 | **P3-3** | `filmbox.py` (相册删除 / 定格动画 / 键盘 / CLI / 重绘状态) | ① 相册删除延时/定格成片后遗留 `lapse_*/`、`frames_*/` 源帧目录；② 定格动画中途换滤镜未同步 `session.look`；③ `get_keyboards()` 泄漏多余设备 fd；④ CLI `photo` 忽略 `--lut-full`；⑤ 主循环 `state` 缺少 `clean_ui`/`zoom`/定格帧数。 | 删除成片时若无同名其他成片存在则同步清理对应源帧目录；定格抓帧/导出同步当前滤镜；关闭未选中的 `InputDevice`；CLI `photo` 透传 `--lut-full` 并修正帮助说明；补全 `state` 字段。 |
+
+---
+
+## 0.9.0 GPU 默认开启补丁复核与加固
+
+基线提交：`f246c82` → `6096f66`（默认启用 8MP GPU 渲染，主线程创建 EGL 上下文）
+
+| 编号 | 位置 | 问题描述 | 修复方案 |
+|---|---|---|---|
+| **G-1** | `var/` | `615eb95` 误提交嵌套路径副本（`var/minis/shared/...`，4197 行）。 | `git rm -rf var` 清理冗余目录。 |
+| **G-2** | `packaging/make_package.py` | `6096f66` 升版本号时覆盖回了旧版打包脚本（丢失源码/图标路径修正、18 支 LUT 打包与依赖声明）。 | 恢复完整修复并保持 `Version: 0.9.0`（产出 `filmbox_0.9.0_all.deb`）。 |
+| **G-3** | `filmbox.py` (`_upload_glow`) | 用 `(id(glow), glow.size)` 做缓存键，上一张图的 `glow` 回收后内存地址被下一张复用会导致跨照片高光鬼影。 | 改用 `weakref.ref(glow)` 并在 `apply()` 结束时清空引用。 |
+| **G-4** | `filmbox.py` (`_upload_lut` / `_upload_glow`) | 切换 `13³`/`33³` LUT 或不同分辨率/变焦时对同一纹理 ID 反复改尺寸调 `glTexImage2D`，在 `vc4` 上易泄漏 CMA BO 或崩溃。 | 记录纹理已分配尺寸；同尺寸走 `glTexSubImage2D`，变尺寸先 `glDeleteTextures` 再重建。 |
+| **G-5** | `filmbox.py` (`_gpu_ready` / `run` / `apply`) | ① 子线程兜底未拦截 `GpuFilm()` 创建；② 冷启动先黑屏卡 2.7s 再开屏与起相机，且残留死方法 `_warm_gpu`；③ GPU 渲染缺分块进度回调（卡 `0%` 跳 `90%`）且额外分配 24 MB 输出图。 | ① 非主线程且未初始化时直接返回 `False`；② 先开 `Framebuffer` 画首帧亮屏，再起相机与主线程 EGL 预热并行重叠，删除 `_warm_gpu`；③ 按瓦片回调 `progress`（`8% → 90%`）并原地 `paste` 回 `rgb` 省下 24 MB 峰值内存。 |

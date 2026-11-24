@@ -63,7 +63,7 @@ CameraStream
 scp -r . pi@<cpz>:~/cybercam
 ssh pi@<cpz> 'sh ~/cybercam/install.sh'
 # 或者在设备上直接打包安装 deb（Raspberry Pi OS 基于 Debian）：
-#   python3 packaging/make_package.py && sudo apt install -y ../filmbox_0.8.6_all.deb
+#   python3 packaging/make_package.py && sudo apt install -y ../filmbox_0.9.0_all.deb
 ```
 
 ## 自检
@@ -77,7 +77,7 @@ python3 selftest.py     # 约 60 秒，覆盖启动/预览/四档变焦/8MP+1080
 ## 目录
 
 ```
-filmbox.py                  应用本体（单文件，Python，FilmBox 0.8.6）
+filmbox.py                  应用本体（单文件，Python，FilmBox 0.9.0）
 packaging/make_package.py   Debian / Raspberry Pi OS (.deb) 打包脚本
 tools/                      GPU (EGL/GLES2) / 多核加速实验与基准脚本
 cybercam-film-share.patch   早期相对上游 v0.5.3 的历史 diff
