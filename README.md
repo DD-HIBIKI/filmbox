@@ -143,9 +143,9 @@ An 8 MP film copy is the expensive part. Measured on the Cardputer Zero
 
 | Engine | 8 MP render | Status |
 |---|---|---|
-| `cpu` (default) | **8 MP: 5.7 s / 2 MP: 1.2 s** | Pillow `Color3DLUT` + integer grain; on a Cardputer Zero with `gpu_mem=64` (415 MB usable) |
+| `cpu` | 8 MP: 5.1–6.4 s | Pillow `Color3DLUT` + integer grain; used when the GPU is unavailable or memory is below 70 MB |
 | `multi` | 2 MP: 1.55 s; 8 MP: not viable | forks 2 workers; at 8 MP the fork copy plus one Pillow buffer per worker triggers the OOM killer, so it is limited to ≤2.5 MP |
-| `gpu` | off by default | works at ≤5 MP in a standalone probe, but crashes intermittently when driven from the app; keep `FILMBOX_ACCEL=cpu` |
+| `gpu` (default) | **8 MP: 1.6–2.1 s** | EGL surfaceless + GLES2 fragment shader doing LUT, halation and grain in one pass, tiled to 1024. `GL_RGB` must be `0x1907` (0x1908 is RGBA — passing it made vc4 over-read and segfault). The EGL context is created on the main thread at startup; worker threads only make it current. |
 
 `filmbox diagnose` prints which engine is active. The GPU and multi-core code
 is kept in `filmbox.py` (`tools/gpu_lut.py` holds the working prototype) so it
