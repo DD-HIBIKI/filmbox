@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.7.5"
+VERSION = "0.7.8"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -262,6 +262,21 @@ GRAY_PALETTE = _palette(GRAY_COLORS)
 
 
 _LUT_CACHE = {}
+
+
+def mem_snapshot():
+    """One-line memory report used in logs when something runs out of RAM."""
+    keys = ("MemAvailable", "MemFree", "Cached", "Dirty", "CmaFree", "SwapFree")
+    got = {}
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                name = line.split(":")[0]
+                if name in keys:
+                    got[name] = int(line.split()[1]) // 1024
+    except OSError:
+        return "meminfo unavailable"
+    return " ".join("%s=%dMB" % (k.replace("Mem", ""), v) for k, v in got.items())
 
 
 def available_mb():
@@ -1305,7 +1320,9 @@ def filtered_still(original, mode, progress=None, full_res=None):
     # Decide the GPU budget before decoding: an 8 MP RGB decode costs ~24 MB,
     # so measuring after it always looks "too tight" and silently falls back.
     gpu_budget = available_mb() - 24
-    room_for_full = available_mb() >= 75
+    # Measured peak for an 8 MP film copy is ~143 MB RSS, so only go full-res
+    # with real headroom; otherwise the allocation fails and the user sees ERR.
+    room_for_full = available_mb() >= 145
     if (is_lut and want_full and room_for_full
             and os.environ.get("FILMBOX_STREAM", "0") == "1"):
         try:
@@ -1332,6 +1349,13 @@ def filtered_still(original, mode, progress=None, full_res=None):
             finally:
                 shutil.rmtree(work, ignore_errors=True)
     with Image.open(original) as handle:
+        if is_lut and not room_for_full:
+            # Ask libjpeg for a 1/2 or 1/4 scale decode: the 2 MP path then costs
+            # ~1/4 of the memory and time of decoding 8 MP and throwing it away.
+            try:
+                handle.draft("RGB", (LUT_SAVE_MAX[0] * 2, LUT_SAVE_MAX[1] * 2))
+            except Exception:
+                pass
         image = handle.convert("RGB")
         if is_lut:
             limit = None if (want_full and room_for_full) else LUT_SAVE_MAX
@@ -1347,7 +1371,8 @@ def filtered_still(original, mode, progress=None, full_res=None):
                 # less than that even though the frame decoded fine, so retry once
                 # at 2 MP instead of failing the whole shot.
                 with camera_log() as log:
-                    log.write(("FilmBox memory fallback: %s\n" % exc).encode())
+                    log.write(("FilmBox memory fallback: %s | %s\n"
+                               % (exc, mem_snapshot())).encode())
                 scale = min(LUT_SAVE_MAX[0] / image.width, LUT_SAVE_MAX[1] / image.height)
                 small = image.resize((max(1, int(image.width * scale)),
                                       max(1, int(image.height * scale))),
