@@ -57,7 +57,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.8.6"
+VERSION = "0.9.0"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
