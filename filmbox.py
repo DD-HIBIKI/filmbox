@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FilmBox 0.6.0 — film-simulation camera for M5Stack Cardputer Zero.
+"""FilmBox 0.8.6 — film-simulation camera for M5Stack Cardputer Zero.
 
 Fork of CyberCam 0.5.3 by Cybern0mads (MIT).  Adds Picamera2 single-session
 camera control, 18 film LUTs, 4-step zoom, full-bleed viewfinder and a
@@ -25,7 +25,11 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import lru_cache
 import array
-import fcntl
+import ctypes
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import gc
 import io
 import json
@@ -58,21 +62,35 @@ HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
 
+def _link_or_copy(src, dst):
+    """Hardlink media on the same filesystem (zero extra space, instant); copy otherwise."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _atomic_copytree(src, dst, copy_fn=shutil.copy2):
+    tmp = dst.with_name("." + dst.name + ".migrating")
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, tmp, copy_function=copy_fn)
+        os.replace(tmp, dst)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _migrate_legacy_paths():
-    """Copy settings/LUTs/photos from the pre-0.6 CyberCam layout, once."""
+    """Migrate settings/LUTs/photos from the pre-0.6 CyberCam layout, once."""
     legacy_cfg = HOME / ".config" / "cybercam"
     new_cfg = HOME / ".config" / "filmbox"
     if legacy_cfg.is_dir() and not new_cfg.exists():
-        try:
-            shutil.copytree(legacy_cfg, new_cfg)
-        except OSError:
-            pass
+        _atomic_copytree(legacy_cfg, new_cfg, shutil.copy2)
     legacy_photos = HOME / "Pictures" / "CyberCam"
     if legacy_photos.is_dir() and not ROOT.exists():
-        try:
-            shutil.copytree(legacy_photos, ROOT)
-        except OSError:
-            pass
+        _atomic_copytree(legacy_photos, ROOT, _link_or_copy)
 
 
 _migrate_legacy_paths()
@@ -93,13 +111,19 @@ VIDEOS = [
     (640, 480, 30, 4_000_000),    # low bandwidth, full FoV
 ]
 VIDEO_LABELS = ("WIDE 960P", "WIDE 1080P", "16:9 720P", "WIDE 480P")
-FILTERS = ["NORMAL", "MONO", "GBOY", "GREEN", "4TONE", "PIXEL", "HICON",
-           "GAMEBOY+", "VHS1998", "CYBERVISION", "FILM1999", "VIRTUALRED",
-           "C64RETRO", "NEONEDGE", "PIXELDREAM", "CYBERGLITCH"]
+BASE_FILTERS = ("NORMAL", "MONO", "GBOY", "GREEN", "4TONE", "PIXEL", "HICON",
+                "GAMEBOY+", "VHS1998", "CYBERVISION", "FILM1999", "VIRTUALRED",
+                "C64RETRO", "NEONEDGE", "PIXELDREAM", "CYBERGLITCH")
+FILTERS = list(BASE_FILTERS)
 
 # --- film LUT support -------------------------------------------------------
-# Drop .cube files in ~/.config/filmbox/luts/ and they appear as extra looks.
+# Drop .cube files in ~/.config/filmbox/luts/ (overrides packaged LUTs in /usr/share/filmbox/luts).
 LUT_DIR = Path(os.path.expanduser("~/.config/filmbox/luts"))
+SYSTEM_LUT_DIRS = (
+    LUT_DIR,
+    Path("/usr/share/filmbox/luts"),
+    Path(__file__).resolve().parent / "luts",
+)
 LUT_PREFIX = "LUT:"
 LUT_SAVE_MAX = (1640, 1232)   # fallback ceiling when RAM is tight
 LUT_FULL_RES = True           # full 8MP film copy (~6s background, viewfinder stays live)
@@ -109,13 +133,37 @@ ZOOMS = (1.0, 1.5, 2.0, 3.0)   # 1x = full sensor field
 
 
 def available_luts():
-    try:
-        return sorted(LUT_DIR.glob("*.cube"))
-    except OSError:
-        return []
+    """All .cube files across user/system/repo LUT dirs (user dir wins on duplicate stems)."""
+    found = {}
+    for folder in SYSTEM_LUT_DIRS:
+        try:
+            if not folder.is_dir():
+                continue
+            for cube in sorted(folder.glob("*.cube")):
+                found.setdefault(cube.stem, cube)
+        except OSError:
+            continue
+    return [found[k] for k in sorted(found)]
 
 
-FILTERS += [LUT_PREFIX + p.stem for p in available_luts()]
+def resolve_lut_path(stem):
+    for folder in SYSTEM_LUT_DIRS:
+        candidate = folder / (stem + ".cube")
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return LUT_DIR / (stem + ".cube")
+
+
+def refresh_filters():
+    global FILTERS
+    FILTERS[:] = list(BASE_FILTERS) + [LUT_PREFIX + p.stem for p in available_luts()]
+    return FILTERS
+
+
+refresh_filters()
 EXTRA_MODES = ("TIMELAPSE", "STOPMOTION", "BOOMERANG")
 MODES = ("PHOTO", "GIF", "VIDEO", "TIMELAPSE", "STOPMOTION", "BOOMERANG")
 MODE_BUTTONS = {"PHOTO": "1", "GIF": "2", "VIDEO": "3", "TIMELAPSE": "4"}
@@ -145,6 +193,7 @@ def timestamp():
 
 
 def load_settings():
+    refresh_filters()
     defaults = {"sound": True, "filter": "NORMAL", "resolution": 0, "video": 0, "rotation": 180, "preview_fps": 25, "timelapse_interval": 1, "lut_full_res": True, "clean_ui": False, "zoom": 1.0}
     try:
         values = json.loads(CONFIG.read_text())
@@ -154,14 +203,13 @@ def load_settings():
     if defaults["filter"] not in FILTERS:
         defaults["filter"] = "NORMAL"
     if isinstance(defaults.get("timelapse_interval"), bool) or not isinstance(
-            defaults.get("timelapse_interval"), int):
-        defaults["timelapse_interval"] = 0
-    if not (0 <= defaults["timelapse_interval"] < len(TIMELAPSE_INTERVALS)):
-        defaults["timelapse_interval"] = 0
+            defaults.get("timelapse_interval"), int) or not (
+            0 <= defaults["timelapse_interval"] < len(TIMELAPSE_INTERVALS)):
+        defaults["timelapse_interval"] = 1
     for key, count in (("resolution", len(RESOLUTIONS)), ("video", len(VIDEOS))):
-        if not isinstance(defaults[key], int) or not (0 <= defaults[key] < count):
+        if isinstance(defaults[key], bool) or not isinstance(defaults[key], int) or not (0 <= defaults[key] < count):
             defaults[key] = 0
-    if defaults["rotation"] not in (0, 180):
+    if isinstance(defaults["rotation"], bool) or defaults["rotation"] not in (0, 180):
         defaults["rotation"] = 180
     for key in ("sound", "lut_full_res", "clean_ui"):
         if not isinstance(defaults.get(key), bool):
@@ -174,10 +222,8 @@ def load_settings():
         defaults["zoom"] = ZOOMS[0]
     else:
         defaults["zoom"] = float(raw_zoom)
-    if defaults["preview_fps"] not in (12, 15, 20, 24, 25, 30):
+    if isinstance(defaults["preview_fps"], bool) or defaults["preview_fps"] not in (12, 15, 20, 24, 25, 30):
         defaults["preview_fps"] = 25
-    if not isinstance(defaults["timelapse_interval"], int) or not (0 <= defaults["timelapse_interval"] < len(TIMELAPSE_INTERVALS)):
-        defaults["timelapse_interval"] = 1
     return defaults
 
 
@@ -263,6 +309,16 @@ GRAY_PALETTE = _palette(GRAY_COLORS)
 
 
 _LUT_CACHE = {}
+_LUT_MONO = {}
+_LUT_CACHE_MAX = 4
+
+
+def _cache_put(cache, key, value, limit=_LUT_CACHE_MAX):
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= limit:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 _LIBC = None
@@ -356,30 +412,43 @@ def load_cube_lut(path):
                 span = (dmax[c] - dmin[c]) or 1.0
                 norm.append(min(1.0, max(0.0, (vals[i + c] - dmin[c]) / span)))
         vals = norm
+    mono = all(
+        abs(vals[i] - vals[i + 1]) < 1e-3 and abs(vals[i + 1] - vals[i + 2]) < 1e-3
+        for i in range(0, len(vals), 3)
+    )
+    _LUT_MONO[key] = mono
     lut = ImageFilter.Color3DLUT(size, vals)
-    _LUT_CACHE[key] = lut
+    _cache_put(_LUT_CACHE, key, lut)
     return lut
 
 
-def add_halation(image, threshold=210, strength=0.6):
+def is_monochrome_cube(path):
+    path = str(path)
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        stamp = 0
+    key = (path, stamp)
+    if key not in _LUT_MONO:
+        load_cube_lut(path)
+    return bool(_LUT_MONO.get(key, False))
+
+
+def _is_grayscale_image(small_rgb):
+    if np is not None:
+        arr = np.asarray(small_rgb, dtype=np.int16)
+        return bool(np.max(np.abs(arr[:, :, 0] - arr[:, :, 1])) <= 1
+                    and np.max(np.abs(arr[:, :, 1] - arr[:, :, 2])) <= 1)
+    ext = small_rgb.getextrema()
+    return ext[0] == ext[1] == ext[2]
+
+
+def add_halation(image, threshold=210, strength=0.6, monochrome=None):
     """Highlight glow. Built at 1/4 scale, blended per strip (8MP-safe, fast)."""
     rgb = image if image.mode == "RGB" else image.convert("RGB")
+    glow = build_glow(rgb, threshold=threshold, strength=strength, monochrome=monochrome)
     w, h = rgb.size
-    sw, sh = max(1, w // 4), max(1, h // 4)
-    small = rgb.resize((sw, sh), Image.Resampling.BOX)
-
-    def ramp(v):
-        if v < threshold:
-            return 0
-        return min(255, int((v - threshold) * 255 // (255 - threshold)))
-
-    mask = small.convert("L").point(ramp)
-    glow = Image.merge("RGB", (mask,
-                               mask.point(lambda v: int(v * 0.72)),
-                               mask.point(lambda v: int(v * 0.42))))
-    glow = glow.filter(ImageFilter.GaussianBlur(max(1.0, max(w, h) / 3200.0)))
-    if strength != 1.0:
-        glow = glow.point(lambda v: int(v * strength))
+    sw, sh = glow.size
     step = 288
     for top in range(0, h, step):
         bottom = min(h, top + step)
@@ -435,7 +504,7 @@ def filter_image(source, mode, animated=False, preview=False):
     if mode.startswith(LUT_PREFIX):
         # 3D LUT: full resolution, no downscale. Preview frames are already LCD-size.
         try:
-            lut = load_cube_lut(str(LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube")))
+            lut = load_cube_lut(str(resolve_lut_path(mode[len(LUT_PREFIX):])))
             return source.convert("RGB").filter(lut)
         except (OSError, ValueError):
             return source.convert("RGB").copy()
@@ -585,61 +654,12 @@ def creative_filter(base, mode):
 # Film-copy accelerators: GPU (EGL/GLES2) and multi-core (fork).
 # Selected at runtime by FILMBOX_ACCEL=auto|gpu|multi|cpu.
 # =============================================================================
-import ctypes
-import struct
-
-def read_cube(path):
-    """(size, bytes RGB8, float array) for a .cube file, cached by mtime."""
-    stamp = os.path.getmtime(path)
-    key = (path, stamp)
-    hit = _CUBE_CACHE.get(key)
-    if hit:
-        return hit
-    size, vals = None, []
-    dmin, dmax = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
-    with open(path, errors="ignore") as handle:
-        for line in handle:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            u = s.upper()
-            if u.startswith("LUT_3D_SIZE"):
-                size = int(s.split()[1]); continue
-            if u.startswith("DOMAIN_MIN"):
-                dmin = tuple(float(x) for x in s.split()[1:4]); continue
-            if u.startswith("DOMAIN_MAX"):
-                dmax = tuple(float(x) for x in s.split()[1:4]); continue
-            if u[0].isalpha():
-                continue
-            try:
-                vals += [float(x) for x in s.split()]
-            except ValueError:
-                pass
-    if size is None or len(vals) != size ** 3 * 3:
-        raise ValueError("bad cube: " + path)
-    if dmin != (0.0, 0.0, 0.0) or dmax != (1.0, 1.0, 1.0):
-        norm = []
-        for i in range(0, len(vals), 3):
-            for c in range(3):
-                span = (dmax[c] - dmin[c]) or 1.0
-                norm.append(min(1.0, max(0.0, (vals[i + c] - dmin[c]) / span)))
-        vals = norm
-    if np is not None:
-        arr = np.array(vals, dtype=np.float32).reshape(size, size, size, 3)
-        data = (np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes()
-    else:
-        arr = None
-        data = bytes(min(255, max(0, int(v * 255 + 0.5))) for v in vals)
-    out = (size, data, arr)
-    _CUBE_CACHE[key] = out
-    return out
-
-
 _CUBE_CACHE = {}
 
 
 def read_cube(path):
-    """(size, bytes RGB8) for a .cube file, cached by mtime."""
+    """(size, bytes RGB8, float array) for a .cube file, cached by mtime."""
+    path = str(path)
     stamp = os.path.getmtime(path)
     key = (path, stamp)
     hit = _CUBE_CACHE.get(key)
@@ -680,25 +700,29 @@ def read_cube(path):
     if np is not None:
         arr = np.array(vals, dtype=np.float32).reshape(size, size, size, 3)
         data = (np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes()
-        lut3 = arr
+        mono = bool(np.max(np.ptp(arr, axis=-1)) < 1e-3)
     else:
+        arr = None
         data = bytes(min(255, max(0, int(v * 255 + 0.5))) for v in vals)
-        lut3 = None
-    out = (size, data, lut3)
-    _CUBE_CACHE[key] = out
+        mono = all(
+            abs(vals[i] - vals[i + 1]) < 1e-3 and abs(vals[i + 1] - vals[i + 2]) < 1e-3
+            for i in range(0, len(vals), 3)
+        )
+    _LUT_MONO[key] = mono
+    out = (size, data, arr)
+    _cache_put(_CUBE_CACHE, key, out)
     return out
 
 
-_CUBE_CACHE = {}
-
-
 # ------------------------------------------------------------- glow (shared)
-def build_glow(image, threshold=210, strength=0.6):
-    """1/4-scale highlight glow, same maths as the CPU pipeline."""
+def build_glow(image, threshold=210, strength=0.6, monochrome=None):
+    """1/4-scale highlight glow. Neutral silver bloom on B&W stocks, warm halation on color."""
     rgb = image if image.mode == "RGB" else image.convert("RGB")
     w, h = rgb.size
     sw, sh = max(1, w // 4), max(1, h // 4)
     small = rgb.resize((sw, sh), Image.Resampling.BOX)
+    if monochrome is None:
+        monochrome = _is_grayscale_image(small)
 
     def ramp(v):
         if v < threshold:
@@ -706,9 +730,12 @@ def build_glow(image, threshold=210, strength=0.6):
         return min(255, int((v - threshold) * 255 // (255 - threshold)))
 
     mask = small.convert("L").point(ramp)
-    glow = Image.merge("RGB", (mask,
-                               mask.point(lambda v: int(v * 0.72)),
-                               mask.point(lambda v: int(v * 0.42))))
+    if monochrome:
+        glow = Image.merge("RGB", (mask, mask, mask))
+    else:
+        glow = Image.merge("RGB", (mask,
+                                   mask.point(lambda v: int(v * 0.72)),
+                                   mask.point(lambda v: int(v * 0.42))))
     glow = glow.filter(ImageFilter.GaussianBlur(max(1.0, max(w, h) / 3200.0)))
     if strength != 1.0:
         glow = glow.point(lambda v: int(v * strength))
@@ -716,8 +743,8 @@ def build_glow(image, threshold=210, strength=0.6):
 
 
 # --------------------------------------------------------------------- GPU
-GL_RGB, GL_RGBA, GL_UBYTE = 0x1908, 0x1908, 0x1401
-GL_TEX2D, GL_LINEAR, GL_CLAMP = 0x0DE1, 0x2601, 0x812F
+GL_RGB, GL_RGBA, GL_UBYTE = 0x1907, 0x1908, 0x1401
+GL_TEX2D, GL_NEAREST, GL_LINEAR, GL_CLAMP = 0x0DE1, 0x2600, 0x2601, 0x812F
 GL_MIN_F, GL_MAG_F = 0x2801, 0x2800
 GL_WRAP_S, GL_WRAP_T = 0x2802, 0x2803
 GL_FBO, GL_COLOR_ATT, GL_FBO_OK = 0x8D40, 0x8CE0, 0x8CD5
@@ -735,16 +762,17 @@ varying vec2 vUv;
 uniform sampler2D tex;
 uniform sampler2D lut;
 uniform sampler2D glow;
-uniform vec2 blockSize;      // pixels in this tile
+uniform vec2 blockSize;      // active pixels in this tile (cols, rows)
 uniform vec2 blockOrigin;    // tile offset in the full image, pixels
 uniform vec2 imgSize;
 uniform float n;             // LUT edge (13 or 33)
-uniform float grainAmp;      // grey levels
+uniform float grainAmp;      // normalized grey amplitude (0..1)
 uniform float glowMix;       // 0 disables halation
-uniform vec2 uvScale;        // tile content vs padded texture
+uniform vec2 uvScale;        // active content ratio vs allocated tile texture
 
 float hash(vec2 p){
-  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+  vec2 q = mod(floor(p), 251.0);
+  return fract((q.x * 17.31 + q.y * 43.17) * (q.x * 0.13 + q.y * 0.07 + 1.13));
 }
 
 void main(){
@@ -763,18 +791,18 @@ void main(){
 
   // halation: screen with a 1/4-scale glow texture
   if (glowMix > 0.0) {
-    vec2 g = (blockOrigin + uv * blockSize) / imgSize;
+    vec2 g = (blockOrigin + vUv * blockSize) / imgSize;
     vec3 gl = texture2D(glow, g).rgb * glowMix;
     col = 1.0 - (1.0 - col) * (1.0 - gl);
   }
 
-  // grain: full-image pixel coordinates keep tiles seamless
+  // grain: full-image pixel coordinates keep tiles seamless and VC4-FP16 safe
   if (grainAmp > 0.0) {
-    vec2 px = blockOrigin + uv * blockSize;
-    float n1 = hash(px) + hash(px + vec2(17.0, 31.0)) - 1.0;   // ±1
+    vec2 px = blockOrigin + vUv * blockSize;
+    float n1 = (hash(px) + hash(px + vec2(17.0, 31.0))) * 0.5 * 2.0 - 1.0;  // ±1 triangular
     float luma = dot(col, vec3(0.299, 0.587, 0.114));
     float w = clamp(1.35 - luma * 1.5, 0.15, 1.0);
-    col += n1 * grainAmp * w * 0.5;
+    col += n1 * grainAmp * w;
   }
   gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }"""
@@ -792,17 +820,13 @@ class GpuFilm:
 
     def __init__(self):
         os.environ.setdefault("EGL_PLATFORM", "surfaceless")
-        try:
-            # Without this the vc4 driver segfaults inside glTexImage2D as soon
-            # as a Pillow image is resident: glibc's arena growth fragments the
-            # region the driver expects for its BOs.
-            ctypes.CDLL("libc.so.6").mallopt(-3, 1048576)  # M_MMAP_THRESHOLD
-        except Exception:
-            pass
         egl = ctypes.CDLL("libEGL.so.1")
         gl = ctypes.CDLL("libGLESv2.so.2")
         egl.eglGetDisplay.restype = ctypes.c_void_p
         egl.eglQueryString.restype = ctypes.c_char_p
+        egl.eglMakeCurrent.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_void_p, ctypes.c_void_p]
+        egl.eglMakeCurrent.restype = ctypes.c_uint
         gl.glGetString.restype = ctypes.c_char_p
 
         dpy = ctypes.c_void_p(egl.eglGetDisplay(ctypes.c_void_p(0)))
@@ -821,48 +845,84 @@ class GpuFilm:
         if not egl.eglMakeCurrent(dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), ctx):
             raise RuntimeError("eglMakeCurrent")
         self.egl, self.gl = egl, gl
-        # Without explicit signatures ctypes passes Python ints/floats with the
-        # wrong widths and the vc4 driver segfaults.
-        u, i, f, v = ctypes.c_uint, ctypes.c_int, ctypes.c_float, ctypes.c_void_p
-        gl.glTexImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
-        gl.glTexSubImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
-        gl.glReadPixels.argtypes = [i, i, i, i, u, u, v]
-        gl.glDrawArrays.argtypes = [u, i, i]
-        gl.glViewport.argtypes = [i, i, i, i]
-        gl.glBindTexture.argtypes = [u, u]
-        gl.glBindFramebuffer.argtypes = [u, u]
-        gl.glFramebufferTexture2D.argtypes = [u, u, u, u, i]
-        gl.glTexParameteri.argtypes = [u, u, i]
-        gl.glPixelStorei.argtypes = [u, i]
-        gl.glActiveTexture.argtypes = [u]
-        gl.glUniform1i.argtypes = [i, i]
-        gl.glUniform1f.argtypes = [i, f]
-        gl.glUniform2f.argtypes = [i, f, f]
-        gl.glGetUniformLocation.argtypes = [u, ctypes.c_char_p]
-        gl.glGetUniformLocation.restype = i
-        maxt = ctypes.c_int()
-        gl.glGetIntegerv(0x0D33, ctypes.byref(maxt))
-        self.maxt = maxt.value or 2048
-        self.renderer = (gl.glGetString(0x1F01) or b"").decode(errors="ignore")
-        self.prog = self._program()
-        self.lut_tex = None
-        self.lut_key = None
-        self.tex, self.fb = ctypes.c_uint(), ctypes.c_uint()
-        gl.glGenTextures(1, ctypes.byref(self.tex))
-        gl.glGenFramebuffers(1, ctypes.byref(self.fb))
-        self.uniforms = {}
-        for name in (b"tex", b"lut", b"glow", b"blockSize", b"blockOrigin",
-                     b"imgSize", b"n", b"grainAmp", b"glowMix", b"uvScale"):
-            self.uniforms[name.decode()] = gl.glGetUniformLocation(self.prog, name)
-        quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
-        self._quad = quad
-        gl.glUseProgram(self.prog)
-        loc = gl.glGetAttribLocation(self.prog, b"pos")
-        gl.glVertexAttribPointer(loc, 2, GL_FLOAT, 0, 0, quad)
-        gl.glEnableVertexAttribArray(loc)
-        gl.glUniform1i(self.uniforms["tex"], 0)
-        gl.glUniform1i(self.uniforms["lut"], 1)
-        gl.glUniform1i(self.uniforms["glow"], 2)
+        self.dpy, self.ctx = dpy, ctx
+        try:
+            u, i, f, v = ctypes.c_uint, ctypes.c_int, ctypes.c_float, ctypes.c_void_p
+            gl.glTexImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
+            gl.glTexSubImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
+            gl.glReadPixels.argtypes = [i, i, i, i, u, u, v]
+            gl.glDrawArrays.argtypes = [u, i, i]
+            gl.glViewport.argtypes = [i, i, i, i]
+            gl.glBindTexture.argtypes = [u, u]
+            gl.glBindFramebuffer.argtypes = [u, u]
+            gl.glFramebufferTexture2D.argtypes = [u, u, u, u, i]
+            gl.glCheckFramebufferStatus.argtypes = [u]
+            gl.glCheckFramebufferStatus.restype = u
+            gl.glTexParameteri.argtypes = [u, u, i]
+            gl.glPixelStorei.argtypes = [u, i]
+            gl.glActiveTexture.argtypes = [u]
+            gl.glUniform1i.argtypes = [i, i]
+            gl.glUniform1f.argtypes = [i, f]
+            gl.glUniform2f.argtypes = [i, f, f]
+            gl.glGetUniformLocation.argtypes = [u, ctypes.c_char_p]
+            gl.glGetUniformLocation.restype = i
+            maxt = ctypes.c_int()
+            gl.glGetIntegerv(0x0D33, ctypes.byref(maxt))
+            self.maxt = maxt.value or 2048
+            self.tile = min(self.maxt, 512)
+            self.renderer = (gl.glGetString(0x1F01) or b"").decode(errors="ignore")
+            self.prog = self._program()
+            self.lut_tex = None
+            self.lut_key = None
+            self.src_tex, self.dst_tex, self.fb = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+            gl.glGenTextures(1, ctypes.byref(self.src_tex))
+            gl.glGenTextures(1, ctypes.byref(self.dst_tex))
+            gl.glGenFramebuffers(1, ctypes.byref(self.fb))
+
+            # Pre-allocate distinct source (RGB) and render-target (RGBA) tile textures
+            # so we never sample and render into the same texture (GLES2 feedback loop).
+            gl.glActiveTexture(GL_TEXTURE0)
+            gl.glBindTexture(GL_TEX2D, self.src_tex)
+            gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_NEAREST)
+            gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_NEAREST)
+            gl.glTexParameteri(GL_TEX2D, GL_WRAP_S, GL_CLAMP)
+            gl.glTexParameteri(GL_TEX2D, GL_WRAP_T, GL_CLAMP)
+            gl.glPixelStorei(0x0CF5, 1)
+            gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, self.tile, self.tile, 0, GL_RGB, GL_UBYTE, None)
+
+            gl.glBindTexture(GL_TEX2D, self.dst_tex)
+            gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_NEAREST)
+            gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_NEAREST)
+            gl.glTexParameteri(GL_TEX2D, GL_WRAP_S, GL_CLAMP)
+            gl.glTexParameteri(GL_TEX2D, GL_WRAP_T, GL_CLAMP)
+            gl.glTexImage2D(GL_TEX2D, 0, GL_RGBA, self.tile, self.tile, 0, GL_RGBA, GL_UBYTE, None)
+            gl.glBindFramebuffer(GL_FBO, self.fb)
+            gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.dst_tex, 0)
+            if gl.glCheckFramebufferStatus(GL_FBO) != GL_FBO_OK:
+                raise RuntimeError("incomplete FBO")
+
+            self.uniforms = {}
+            for name in (b"tex", b"lut", b"glow", b"blockSize", b"blockOrigin",
+                         b"imgSize", b"n", b"grainAmp", b"glowMix", b"uvScale"):
+                self.uniforms[name.decode()] = gl.glGetUniformLocation(self.prog, name)
+            quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
+            self._quad = quad
+            self.pos_loc = gl.glGetAttribLocation(self.prog, b"pos")
+            gl.glUseProgram(self.prog)
+            gl.glVertexAttribPointer(self.pos_loc, 2, GL_FLOAT, 0, 0, quad)
+            gl.glEnableVertexAttribArray(self.pos_loc)
+            gl.glUniform1i(self.uniforms["tex"], 0)
+            gl.glUniform1i(self.uniforms["lut"], 1)
+            gl.glUniform1i(self.uniforms["glow"], 2)
+        finally:
+            egl.eglMakeCurrent(dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_void_p(0))
+
+    def _make_current(self):
+        if not self.egl.eglMakeCurrent(self.dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), self.ctx):
+            raise RuntimeError("eglMakeCurrent worker")
+
+    def _release_current(self):
+        self.egl.eglMakeCurrent(self.dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_void_p(0))
 
     def _program(self):
         gl = self.gl
@@ -916,52 +976,52 @@ class GpuFilm:
 
     def apply_band(self, block, top, w, h, cube_path, glow, grain=5.0):
         """Render one horizontal band with the shared LUT and glow textures."""
+        with _ACCEL_LOCK:
+            self._make_current()
+            try:
+                return self._render_tiles(block, top, w, h, cube_path, glow, grain)
+            finally:
+                self._release_current()
+
+    def _render_tiles(self, rgb, origin_top, full_w, full_h, cube_path, glow, grain):
         self._upload_lut(cube_path)
         self._upload_glow(glow)
         gl = self.gl
+        tile = self.tile
+        bw, bh = rgb.size
+        grain_norm = max(0.0, float(grain)) * 1.2 / 255.0
         gl.glUseProgram(self.prog)
+        gl.glVertexAttribPointer(self.pos_loc, 2, GL_FLOAT, 0, 0, self._quad)
+        gl.glEnableVertexAttribArray(self.pos_loc)
         gl.glUniform1f(self.uniforms["n"], ctypes.c_float(self.lut_size))
-        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(max(0.0, grain)))
-        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(0.6 if glow is not None else 0.0))
-        gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(w), ctypes.c_float(h))
-        bw, bh = block.size
-        tile = min(getattr(self, "maxt", 2048), 512)
+        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(grain_norm))
+        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(1.0 if glow is not None else 0.0))
+        gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(full_w), ctypes.c_float(full_h))
+        gl.glBindFramebuffer(GL_FBO, self.fb)
+        gl.glActiveTexture(GL_TEXTURE0)
+        gl.glBindTexture(GL_TEX2D, self.src_tex)
+        gl.glPixelStorei(0x0CF5, 1)
         out = Image.new("RGB", (bw, bh))
         buf = ctypes.create_string_buffer(tile * tile * 4)
-        gl.glActiveTexture(GL_TEXTURE0)
-        gl.glBindTexture(GL_TEX2D, self.tex)
-        gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
-        gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
-        gl.glBindFramebuffer(GL_FBO, self.fb)
-        gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
-        gl.glPixelStorei(0x0CF5, 1)
-        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, tile, tile, 0, GL_RGB, GL_UBYTE, None)
         for y in range(0, bh, tile):
             rows = min(tile, bh - y)
             for x in range(0, bw, tile):
                 cols = min(tile, bw - x)
-                if cols == tile and rows == tile:
-                    piece = block.crop((x, y, x + tile, y + tile))
-                else:
-                    piece = Image.new("RGB", (tile, tile))
-                    piece.paste(block.crop((x, y, x + cols, y + rows)), (0, 0))
-                raw = piece.tobytes()
-                gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, tile, tile, GL_RGB,
+                raw = rgb.crop((x, y, x + cols, y + rows)).tobytes()
+                gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, cols, rows, GL_RGB,
                                    GL_UBYTE, ctypes.c_char_p(raw))
-                del piece
-                gl.glViewport(0, 0, tile, tile)
+                gl.glViewport(0, 0, cols, rows)
                 gl.glUniform2f(self.uniforms["blockSize"],
                                ctypes.c_float(cols), ctypes.c_float(rows))
                 gl.glUniform2f(self.uniforms["uvScale"],
-                               ctypes.c_float(cols / tile), ctypes.c_float(rows / tile))
+                               ctypes.c_float(cols / float(tile)),
+                               ctypes.c_float(rows / float(tile)))
                 gl.glUniform2f(self.uniforms["blockOrigin"],
-                               ctypes.c_float(x), ctypes.c_float(top + y))
+                               ctypes.c_float(x), ctypes.c_float(origin_top + y))
                 gl.glDrawArrays(GL_STRIP, 0, 4)
-                gl.glReadPixels(0, 0, tile, tile, GL_RGBA, GL_UBYTE, buf)
-                part = Image.frombytes("RGBA", (tile, tile), buf.raw[:tile * tile * 4])
-                part = part.convert("RGB").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-                out.paste(part.crop((0, 0, cols, rows)), (x, y))
-                del part
+                gl.glReadPixels(0, 0, cols, rows, GL_RGBA, GL_UBYTE, buf)
+                part = Image.frombytes("RGBA", (cols, rows), buf.raw[:cols * rows * 4]).convert("RGB")
+                out.paste(part, (x, y))
         return out
 
     def _upload_lut(self, cube_path):
@@ -995,75 +1055,18 @@ class GpuFilm:
     def apply(self, image, cube_path, halation=True, grain=5.0):
         rgb = image if image.mode == "RGB" else image.convert("RGB")
         w, h = rgb.size
-        gl = self.gl
-        self._upload_lut(cube_path)
-        glow = build_glow(rgb) if halation else None
-        if glow is not None:
-            if not hasattr(self, "glow_tex"):
-                self.glow_tex = ctypes.c_uint()
-                gl.glGenTextures(1, ctypes.byref(self.glow_tex))
-            gl.glActiveTexture(GL_TEXTURE2)
-            gl.glBindTexture(GL_TEX2D, self.glow_tex)
-            for p in (GL_MIN_F, GL_MAG_F):
-                gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
-            for p in (GL_WRAP_S, GL_WRAP_T):
-                gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
-            gl.glPixelStorei(0x0CF5, 1)
-            gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, glow.width, glow.height, 0,
-                            GL_RGB, GL_UBYTE, ctypes.c_char_p(glow.tobytes()))
-
-        gl.glUseProgram(self.prog)
-        gl.glUniform1f(self.uniforms["n"], ctypes.c_float(self.lut_size))
-        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(max(0.0, grain)))
-        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(0.6 if halation else 0.0))
-        gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(w), ctypes.c_float(h))
-
-        out = Image.new("RGB", (w, h))
-        # 1024 tiles: a 2048 tile would hold 16 MB of read-back plus the crop,
-        # which is enough to tip this 512 MB board into the OOM killer.
-        tile = min(getattr(self, "maxt", 2048), 512)
-        buf = ctypes.create_string_buffer(tile * tile * 4)
-        gl.glActiveTexture(GL_TEXTURE0)
-        gl.glBindTexture(GL_TEX2D, self.tex)
-        gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
-        gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
-        gl.glBindFramebuffer(GL_FBO, self.fb)
-        gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
-        gl.glPixelStorei(0x0CF5, 1)                       # GL_UNPACK_ALIGNMENT
-        # Allocate the tile ONCE: re-specifying it per tile leaks driver BOs
-        # until the 38 MB of CMA is gone, then vc4 segfaults.
-        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, tile, tile, 0, GL_RGB, GL_UBYTE, None)
-        for top in range(0, h, tile):
-            rows = min(tile, h - top)
-            for left in range(0, w, tile):
-                cols = min(tile, w - left)
-                if cols == tile and rows == tile:
-                    block = rgb.crop((left, top, left + tile, top + tile))
-                else:
-                    # vc4 segfaults when a texture is re-specified at a different
-                    # size, so pad every edge tile to the full tile size.
-                    block = Image.new("RGB", (tile, tile))
-                    block.paste(rgb.crop((left, top, left + cols, top + rows)), (0, 0))
-                raw = block.tobytes()
-                gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, tile, tile, GL_RGB,
-                                   GL_UBYTE, ctypes.c_char_p(raw))
-                del block
-                gl.glViewport(0, 0, tile, tile)
-                gl.glUniform2f(self.uniforms["blockSize"],
-                               ctypes.c_float(cols), ctypes.c_float(rows))
-                gl.glUniform2f(self.uniforms["uvScale"],
-                               ctypes.c_float(cols / tile), ctypes.c_float(rows / tile))
-                gl.glUniform2f(self.uniforms["blockOrigin"],
-                               ctypes.c_float(left), ctypes.c_float(top))
-                gl.glDrawArrays(GL_STRIP, 0, 4)
-                gl.glReadPixels(0, 0, tile, tile, GL_RGBA, GL_UBYTE, buf)
-                # frombuffer proved to segfault on this Mesa build; frombytes copies
-                # 3 MB per tile, which is cheap next to a crash.
-                part = Image.frombytes("RGBA", (tile, tile), buf.raw[:tile * tile * 4])
-                part = part.convert("RGB").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-                out.paste(part.crop((0, 0, cols, rows)), (left, top))
-                del part
-        return out
+        glow = None
+        if halation:
+            mono = is_monochrome_cube(cube_path)
+            sw, sh = max(1, w // 4), max(1, h // 4)
+            small_graded = rgb.resize((sw, sh), Image.Resampling.BOX).filter(load_cube_lut(str(cube_path)))
+            glow = build_glow(small_graded, monochrome=mono)
+        with _ACCEL_LOCK:
+            self._make_current()
+            try:
+                return self._render_tiles(rgb, 0, w, h, cube_path, glow, grain)
+            finally:
+                self._release_current()
 
 
 # ------------------------------------------------------------- multicore
@@ -1149,7 +1152,7 @@ class MultiCoreFilm:
             stage.paste(Image.frombytes("RGB", (w, bottom - top), data), (0, top))
         if halation:
             _MP["img"] = stage
-            _MP["glow"] = build_glow(stage)
+            _MP["glow"] = build_glow(stage, monochrome=is_monochrome_cube(cube_path))
         else:
             _MP["glow"] = None
         _MP["img"] = stage
@@ -1182,9 +1185,9 @@ def _accel_status():
 
 
 GRAIN_STRENGTH = 5.0
-GPU_MAX_PIXELS = 5_000_000
-GPU_MIN_FREE_MB = 80
-_ACCEL = os.environ.get("FILMBOX_ACCEL", "cpu").strip().lower()
+GPU_MAX_PIXELS = 8_500_000
+GPU_MIN_FREE_MB = 70
+_ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
@@ -1228,7 +1231,7 @@ def film_copy(image, cube_path, progress=None, gpu_budget=None):
         result.paste(result.crop((0, top, w, bottom)).filter(lut), (0, top))
         if progress:
             progress(min(60, (top + step) * 60 // max(1, h)))
-    result = add_halation(result)
+    result = add_halation(result, monochrome=is_monochrome_cube(cube_path))
     if progress:
         progress(75)
     result = add_grain(result, GRAIN_STRENGTH)
@@ -1257,6 +1260,8 @@ def _raw_prepare(original, workdir):
                      "-f", "rawvideo", "-pix_fmt", "rgb24", str(small)], timeout=60)
     except Exception:
         return None
+    if not small.exists() or small.stat().st_size < sw * sh * 3:
+        return None
     return raw, small, w, h, sw, sh
 
 
@@ -1265,11 +1270,13 @@ def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None):
     step = 512
     out = Image.new("RGB", (w, h))
     row = w * 3
+    lut = load_cube_lut(str(cube_path))
+    mono = is_monochrome_cube(cube_path)
     with open(raw, "rb") as handle:
         mm = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
         with open(small, "rb") as sh_handle:
             thumb = Image.frombuffer("RGB", (sw, sh), sh_handle.read(), "raw", "RGB", 0, 1)
-            glow = build_glow(thumb) if True else None
+            glow = build_glow(thumb.filter(lut), monochrome=mono)
         gpu = _gpu_ready(w * h, available_mb())
         done = 0
         for top in range(0, h, step):
@@ -1331,11 +1338,28 @@ def _render_band(block, top, w, h, cube_path, glow, use_gpu):
     return add_grain(band, GRAIN_STRENGTH, seed=top)
 
 
+def _atomic_save_image(image, path, fmt=None, **kwargs):
+    """Write image to a hidden temp file first so interrupted saves never appear in Gallery."""
+    path = Path(path)
+    tmp = path.with_name("." + path.name + ".tmp")
+    fmt = fmt or ("JPEG" if path.suffix.lower() in (".jpg", ".jpeg") else "PNG")
+    try:
+        image.save(tmp, format=fmt, **kwargs)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def filtered_still(original, mode, progress=None, full_res=None):
     """Render the film copy. LUT work is tiled so an 8MP frame stays in RAM."""
     if mode == "NORMAL":
         return None
     is_lut = mode.startswith(LUT_PREFIX)
+    cube_file = resolve_lut_path(mode[len(LUT_PREFIX):]) if is_lut else None
     # Measure free RAM *before* decoding: an 8MP RGB copy alone eats ~24 MB.
     want_full = LUT_FULL_RES if full_res is None else bool(full_res)
     # Decide the GPU budget before decoding: an 8 MP RGB decode costs ~24 MB,
@@ -1356,13 +1380,13 @@ def filtered_still(original, mode, progress=None, full_res=None):
             try:
                 prep = _raw_prepare(original, work)
                 if prep is not None:
-                    result = film_copy_raw(*prep, LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube"),
-                                           progress)
+                    result = film_copy_raw(*prep, cube_file, progress)
                     path = original.with_name(original.stem + "_" +
                                               mode.replace(":", "-").lower() + ".jpg")
-                    result.save(path, quality=93, subsampling=1)
+                    _atomic_save_image(result, path, "JPEG", quality=93, subsampling=1)
                     if progress:
                         progress(100)
+                    reclaim_memory()
                     return path
             except Exception as exc:
                 with camera_log() as log:
@@ -1384,7 +1408,6 @@ def filtered_still(original, mode, progress=None, full_res=None):
                 scale = min(limit[0] / image.width, limit[1] / image.height)
                 image = image.resize((int(image.width * scale), int(image.height * scale)),
                                      Image.Resampling.BOX)
-            cube_file = LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube")
             try:
                 result = film_copy(image, cube_file, progress, gpu_budget)
             except (MemoryError, OSError) as exc:
@@ -1408,10 +1431,10 @@ def filtered_still(original, mode, progress=None, full_res=None):
             result.width * result.height / 1e6)
         path = original.with_name(original.stem + "_" +
                                   mode.replace(":", "-").lower() + tag + ".jpg")
-        result.save(path, quality=93, subsampling=1)
+        _atomic_save_image(result, path, "JPEG", quality=93, subsampling=1)
     else:
         path = original.with_name(original.stem + "_" + mode.lower() + ".png")
-        result.save(path)
+        _atomic_save_image(result, path, "PNG")
     if progress:
         progress(100)
     reclaim_memory()
@@ -1436,9 +1459,9 @@ def capture_still(resolution=(3280, 2464), sound=True, rotation=180):
     return output
 
 
-def take_photo(mode="NORMAL", resolution=(3280, 2464), sound=True, rotation=180):
+def take_photo(mode="NORMAL", resolution=(3280, 2464), sound=True, rotation=180, full_res=None):
     output = capture_still(resolution, sound, rotation)
-    filtered = filtered_still(output, mode) if mode != "NORMAL" else None
+    filtered = filtered_still(output, mode, full_res=full_res) if mode != "NORMAL" else None
     return output, filtered
 
 
@@ -1486,27 +1509,30 @@ class CameraStream:
         return Transform(hflip=True, vflip=True) if self.rotation == 180 else Transform()
 
     def start(self):
-        if self.picam is not None:
-            return
-        from picamera2 import Picamera2
-        self.error = None
-        transform = self._transform()
-        picam = Picamera2()
-        try:
-            self._build_configs(picam, transform)
-            picam.configure(self.video_config)
-            picam.start()
-        except Exception:
+        with self.camlock:
+            if self.picam is not None:
+                return
+            from picamera2 import Picamera2
+            self.error = None
+            transform = self._transform()
+            picam = Picamera2()
             try:
-                picam.close()
+                self._build_configs(picam, transform)
+                picam.configure(self.video_config)
+                picam.start()
             except Exception:
-                pass
-            raise
-        self.picam = picam
-        self._apply_crop()
-        self.running = True
-        self.worker = threading.Thread(target=self._loop, daemon=True)
-        self.worker.start()
+                try:
+                    picam.close()
+                except Exception:
+                    pass
+                raise
+            self.picam = picam
+            self._still_cache.clear()
+            self._record_cache.clear()
+            self._apply_crop()
+            self.running = True
+            self.worker = threading.Thread(target=self._loop, daemon=True)
+            self.worker.start()
 
     def _build_configs(self, picam, transform):
         # 1640x1232 keeps the full field: the 640x480 mode is a 2x centre crop.
@@ -1514,7 +1540,6 @@ class CameraStream:
             main={"size": self.size, "format": "RGB888"},
             sensor={"output_size": (1640, 1232), "bit_depth": 10},
             buffer_count=3, transform=transform)
-
 
         self.still_config = picam.create_still_configuration(
             main={"size": SENSOR_SIZE, "format": "RGB888"},
@@ -1527,15 +1552,18 @@ class CameraStream:
         self.running = False
         with self.lock:
             self.lock.notify_all()
-        if self.worker is not None:
-            self.worker.join(timeout=3)
-        try:
-            self.picam.stop()
-            self.picam.close()
-        except Exception:
-            pass
-        self.picam = None
-        self.worker = None
+        worker = self.worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=3)
+        with self.camlock:
+            if self.picam is not None:
+                try:
+                    self.picam.stop()
+                    self.picam.close()
+                except Exception:
+                    pass
+                self.picam = None
+            self.worker = None
 
     def _restore_preview(self):
         """Return to the live-view configuration after any failure."""
@@ -1640,63 +1668,77 @@ class CameraStream:
         self._apply_crop()
 
     # --------------------------------------------------------------- stills
-    def _still_config(self, size):
+    def _still_config(self, size, sensor_size=SENSOR_SIZE):
         size = (int(size[0]), int(size[1]))
-        cached = self._still_cache.get(size)
+        sensor_size = (int(sensor_size[0]), int(sensor_size[1]))
+        key = (size, sensor_size)
+        cached = self._still_cache.get(key)
         if cached is None:
             # keep the full sensor field: without this libcamera may pick the
             # 640x480 mode (2x centre crop) for small output sizes
             cached = self.picam.create_still_configuration(
                 main={"size": size, "format": "RGB888"},
-                sensor={"output_size": SENSOR_SIZE, "bit_depth": 10},
+                sensor={"output_size": sensor_size, "bit_depth": 10},
                 buffer_count=1, transform=self._transform())
-            self._still_cache[size] = cached
+            self._still_cache[key] = cached
         return cached
 
-    def _crop_file(self, path):
-        """Software crop so the file keeps the sensor aspect (4:3)."""
-        if float(self.zoom) <= ZOOMS[0]:
-            return
+    def _crop_file(self, path, limit=None):
+        """Software crop for zoom and non-4:3 presets (e.g. 1080P 16:9)."""
         sw, sh = SENSOR_SIZE
-        x, y, w, h = self._rect_in(sw, sh, sw / float(sh), 1.0 / float(self.zoom))
+        target = limit or SENSOR_SIZE
+        target_aspect = target[0] / float(target[1])
+        sensor_aspect = sw / float(sh)
+        zoom = float(self.zoom)
+        if zoom <= ZOOMS[0] and abs(target_aspect - sensor_aspect) < 1e-3:
+            return
         with Image.open(path) as handle:
             image = handle.convert("RGB")
-            sx, sy = image.width / float(sw), image.height / float(sh)
-            box = (int(x * sx), int(y * sy), int((x + w) * sx), int((y + h) * sy))
-            image.crop(box).save(path, quality=93, subsampling=1)
+        iw, ih = image.size
+        x, y, cw, ch = self._rect_in(iw, ih, target_aspect, 1.0 / zoom)
+        cropped = image.crop((x, y, x + cw, y + ch))
+        if cropped.width > target[0] or cropped.height > target[1]:
+            cropped = cropped.resize(target, Image.Resampling.LANCZOS)
+        _atomic_save_image(cropped, path, "JPEG", quality=93, subsampling=1)
 
     def capture_still(self, path, resolution=None):
         limit = resolution or SENSOR_SIZE
         # Bursts of 8 MP shots can outrun the CMA pool: a capture then fails with
-        # ENOMEM. Back off once, then step the sensor resolution down.
+        # ENOMEM. Back off first, then step the sensor mode down to 2x2 binned 2MP.
         last = None
         for attempt in range(4):
+            sensor_mode = SENSOR_SIZE if attempt < 2 else (1640, 1232)
+            eff_limit = limit if attempt < 2 else (min(limit[0], 1640), min(limit[1], 1232))
             try:
-                return self._capture_once(path, limit)
+                return self._capture_once(path, eff_limit, sensor_mode)
             except OSError as exc:
                 last = exc
                 if getattr(exc, "errno", None) != 12:
                     raise
                 with camera_log() as log:
-                    log.write(("FilmBox capture ENOMEM try %d | %s\n"
-                               % (attempt + 1, mem_snapshot())).encode())
+                    log.write(("FilmBox capture ENOMEM try %d (%s) | %s\n"
+                               % (attempt + 1, sensor_mode, mem_snapshot())).encode())
                 self._restore_preview()
                 reclaim_memory()
                 time.sleep(0.4 + 0.3 * attempt)
         raise last
 
-    def _capture_once(self, path, limit):
-        scale = min(1.0, limit[0] / SENSOR_SIZE[0], limit[1] / SENSOR_SIZE[1])
-        size = (int(SENSOR_SIZE[0] * scale) // 2 * 2,
-                int(SENSOR_SIZE[1] * scale) // 2 * 2)
-        config = self._still_config(size)
+    def _capture_once(self, path, limit, sensor_size=SENSOR_SIZE):
+        sw, sh = SENSOR_SIZE
+        zoom = float(self.zoom)
+        scale = min(1.0, max(limit[0] / float(sw), limit[1] / float(sh)) * zoom)
+        size = (max(2, min(sensor_size[0], int(round(sw * scale))) // 2 * 2),
+                max(2, min(sensor_size[1], int(round(sh * scale))) // 2 * 2))
         with self.camlock:
             picam = self.picam
+            if picam is None:
+                raise RuntimeError("camera not started")
+            config = self._still_config(size, sensor_size=sensor_size)
             picam.stop()
             picam.switch_mode(config)
             picam.start()
             try:
-                # full sensor into the file; zoom is applied in software below
+                # full sensor into the file; zoom & aspect crop applied deterministically below
                 picam.set_controls({"ScalerCrop": (0, 0) + tuple(SENSOR_SIZE)})
                 time.sleep(0.08)
                 picam.capture_file(str(path))
@@ -1708,7 +1750,7 @@ class CameraStream:
                     self._apply_crop()
                 except Exception:
                     self._restore_preview()
-        self._crop_file(path)
+        self._crop_file(path, limit)
 
     # ---------------------------------------------------------------- video
     def _record_config(self, size):
@@ -1789,10 +1831,7 @@ class CameraStream:
             return None
         fps = 30.0
         elapsed = max(0.5, time.monotonic() - started) if started else 0.0
-        try:
-            frames = raw.read_bytes().count(b"\xff\xd8")
-        except OSError:
-            frames = 0
+        frames = _count_mjpeg_frames(raw)
         if frames and elapsed:
             fps = min(120.0, max(1.0, frames / elapsed))
         with camera_log() as log:
@@ -1818,6 +1857,24 @@ class CameraStream:
         with camera_log() as log:
             log.write(("FilmBox raw kept: %s\n" % raw).encode())
         raise RuntimeError("remux failed; raw kept at %s" % raw.name)
+
+
+def _count_mjpeg_frames(path, chunk_size=65536):
+    """Count JPEG SOI markers (0xFF 0xD8) in bounded 64 KB chunks to avoid OOM on long videos."""
+    count = 0
+    tail = b""
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                buf = fh.read(chunk_size)
+                if not buf:
+                    break
+                data = tail + buf
+                count += data.count(b"\xff\xd8")
+                tail = buf[-1:] if buf[-1:] == b"\xff" else b""
+    except (OSError, MemoryError):
+        return 0
+    return count
 
 
 def save_gif(frames, mode, output, duration=133):
@@ -1989,12 +2046,13 @@ def encode_mp4(frames, destination, look="NORMAL", fps=15, size=MOVIE_SIZE, prog
 
 class TimelapseCapture:
     """Manual stop from UI; fixed frame count for CLI. Originals are retained."""
-    def __init__(self, interval=5, resolution=(1640,1232), rotation=180, look="NORMAL", fps=15):
+    def __init__(self, interval=5, resolution=(1640,1232), rotation=180, look="NORMAL", fps=15, zoom=1.0):
         self.interval = max(2.0, float(interval))
         self.resolution = resolution
         self.rotation = rotation
         self.look = look
         self.fps = fps
+        self.zoom = float(zoom) if zoom in ZOOMS else 1.0
         self.stop_event = threading.Event()
         self.stamp = timestamp()
         self.folder = ROOT / "Timelapse" / ("lapse_" + self.stamp)
@@ -2007,16 +2065,23 @@ class TimelapseCapture:
     def run(self, count=None, progress=None, export_progress=None):
         if count is not None and not (1 <= count <= 20000):
             raise ValueError("Timelapse frame count must be 1..20000")
+        if not shutil.which("rpicam-still"):
+            raise RuntimeError("Timelapse requires rpicam-still (sudo apt install rpicam-apps)")
         self.folder.mkdir(parents=True, exist_ok=True)
         n = 0
-        # Scheduling is relative to the end of each still capture; ensures the
-        # camera does not spawn overlapping processes on slower systems.
+        roi_args = []
+        if self.zoom > 1.0:
+            span = 1.0 / self.zoom
+            off = (1.0 - span) * 0.5
+            roi_args = ["--roi", f"{off:.4f},{off:.4f},{span:.4f},{span:.4f}"]
+        # Scheduling accounts for capture duration so intervals stay accurate without overlapping.
         while not self.stop_event.is_set() and (count is None or n < count):
+            frame_started = time.monotonic()
             path = self.folder / f"frame_{n:06d}.jpg"
             w,h = self.resolution
             command = ["rpicam-still", "-n", "-t", "950", "--mode", FULL_STILL_MODE,
                        "--width", str(w), "--height", str(h),
-                       "--rotation", str(self.rotation), "-o", str(path)]
+                       "--rotation", str(self.rotation)] + roi_args + ["-o", str(path)]
             run_command(command, timeout=35)
             if path.stat().st_size < 1024:
                 raise RuntimeError("Timelapse frame is empty: " + str(path))
@@ -2026,7 +2091,8 @@ class TimelapseCapture:
                 progress(n)
             if count is not None and n >= count:
                 break
-            if self.stop_event.wait(self.interval):
+            wait_for = max(0.05, self.interval - (time.monotonic() - frame_started))
+            if self.stop_event.wait(wait_for):
                 break
         if not self.frames:
             raise RuntimeError("Timelapse stopped without any frames")
@@ -2146,7 +2212,7 @@ def safe_web_path(rel, root=ROOT):
 
 
 class GalleryHTTP(BaseHTTPRequestHandler):
-    server_version = "FilmBox/0.6"
+    server_version = "FilmBox/" + VERSION
 
     def log_message(self, fmt, *args):
         # Do not log URLs, as they may include the one-time gallery access token.
@@ -2174,7 +2240,13 @@ class GalleryHTTP(BaseHTTPRequestHandler):
         session = cookie.get("filmbox_session")
         return bool(session and hmac.compare_digest(session.value, self.server.gallery_token))
 
+    def do_HEAD(self):
+        self._dispatch(send_body=False)
+
     def do_GET(self):
+        self._dispatch(send_body=True)
+
+    def _dispatch(self, send_body=True):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         # One-time token sets an HttpOnly cookie and redirects to URL without token.
@@ -2190,19 +2262,28 @@ class GalleryHTTP(BaseHTTPRequestHandler):
         if not self._authorized():
             body=b"FilmBox: access token required. Use the URL shown by 'filmbox web'."
             self._headers(403,"text/plain; charset=utf-8",len(body))
-            self.wfile.write(body)
+            if send_body:
+                self.wfile.write(body)
             return
         if parsed.path == "/":
-            self._index()
+            self._index(send_body=send_body)
         elif parsed.path == "/media":
-            self._media(params)
+            self._media(params, send_body=send_body)
         else:
             self._headers(404,"text/plain; charset=utf-8",0)
 
-    def _index(self):
+    def _index(self, send_body=True):
         items = web_media(self.server.media_root)
+        try:
+            page = max(1, int(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("page", ["1"])[0]))
+        except ValueError:
+            page = 1
+        per_page = 120
+        total_pages = max(1, (len(items) + per_page - 1) // per_page)
+        page = min(page, total_pages)
+        subset = items[(page - 1) * per_page: page * per_page]
         cards = []
-        for item in items[:150]:
+        for item in subset:
             rel = item.relative_to(self.server.media_root).as_posix()
             link = "/media?path=" + urllib.parse.quote(rel, safe="")
             name = html.escape(item.name)
@@ -2211,13 +2292,19 @@ class GalleryHTTP(BaseHTTPRequestHandler):
             else:
                 art = '<img loading="lazy" alt="'+name+'" src="'+link+'">'
             cards.append('<article>'+art+'<div class="info"><strong>'+name+'</strong><a href="'+link+'&download=1">Download</a></div></article>')
+        pager = ""
+        if total_pages > 1:
+            prev_link = f'<a href="/?page={page - 1}">&larr; Newer</a> ' if page > 1 else ""
+            next_link = f' <a href="/?page={page + 1}">Older &rarr;</a>' if page < total_pages else ""
+            pager = f'<nav style="padding:10px 5%;text-align:center">{prev_link}<span>Page {page}/{total_pages} ({len(items)} items)</span>{next_link}</nav>'
         html_doc = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FilmBox Gallery</title><style>body{margin:0;background:#080e18;color:#e8f9fa;font:15px system-ui,sans-serif}header{padding:20px 5%;background:#112134;border-bottom:2px solid #11dddd}h1{margin:0;color:#17f4e4}small{color:#abc}main{padding:15px 5%;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}article{background:#132333;border:1px solid #275565;border-radius:10px;overflow:hidden}img,video{width:100%;height:200px;object-fit:contain;background:#070c12}.info{padding:12px;overflow-wrap:anywhere}.info strong{display:block;margin-bottom:8px}a{color:#1bfff0}</style></head><body><header><h1>FILMBOX</h1><small>film camera · Local Wi-Fi Gallery · Downloads</small></header><main>'''+"".join(cards)+'''</main></body></html>'''
+<title>FilmBox Gallery</title><style>body{margin:0;background:#080e18;color:#e8f9fa;font:15px system-ui,sans-serif}header{padding:20px 5%;background:#112134;border-bottom:2px solid #11dddd}h1{margin:0;color:#17f4e4}small{color:#abc}main{padding:15px 5%;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}article{background:#132333;border:1px solid #275565;border-radius:10px;overflow:hidden}img,video{width:100%;height:200px;object-fit:contain;background:#070c12}.info{padding:12px;overflow-wrap:anywhere}.info strong{display:block;margin-bottom:8px}a{color:#1bfff0}</style></head><body><header><h1>FILMBOX</h1><small>film camera · Local Wi-Fi Gallery · Downloads</small></header><main>'''+"".join(cards)+'''</main>'''+pager+'''</body></html>'''
         data=html_doc.encode("utf-8")
         self._headers(200,"text/html; charset=utf-8",len(data))
-        self.wfile.write(data)
+        if send_body:
+            self.wfile.write(data)
 
-    def _media(self, params):
+    def _media(self, params, send_body=True):
         try:
             rel = params.get("path", [""])[0]
             path = safe_web_path(rel,self.server.media_root)
@@ -2225,9 +2312,9 @@ class GalleryHTTP(BaseHTTPRequestHandler):
             self._headers(404,"text/plain; charset=utf-8",0)
             return
         size=path.stat().st_size
-        start,end=0,size-1
+        start,end=0,max(0, size-1)
         range_header=self.headers.get("Range", "")
-        if range_header:
+        if range_header and size > 0:
             try:
                 if not range_header.startswith("bytes=") or "," in range_header:
                     raise ValueError()
@@ -2246,15 +2333,19 @@ class GalleryHTTP(BaseHTTPRequestHandler):
                 return
         headers={"Accept-Ranges":"bytes"}
         if params.get("download", [""])[0] == "1":
-            headers["Content-Disposition"]='attachment; filename="'+path.name.replace('"','')+'"'
-        if range_header:
+            safe_name = path.name.replace('"', "").replace("\r", "").replace("\n", "")
+            headers["Content-Disposition"]='attachment; filename="'+safe_name+'"'
+        if range_header and size > 0:
             headers["Content-Range"]=f"bytes {start}-{end}/{size}"
         mime=mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        self._headers(206 if range_header else 200,mime,end-start+1,headers)
+        content_len = (end - start + 1) if size > 0 else 0
+        self._headers(206 if (range_header and size > 0) else 200, mime, content_len, headers)
+        if not send_body or content_len <= 0:
+            return
         try:
             with path.open("rb") as handle:
                 handle.seek(start)
-                remaining=end-start+1
+                remaining=content_len
                 while remaining>0:
                     chunk=handle.read(min(65536,remaining))
                     if not chunk:
@@ -2325,6 +2416,8 @@ class WifiShare:
 
     def start(self):
         if self.server is not None:
+            self.error = None
+            self.url = share_url(self.port, self.token)
             return self.url
         try:
             self.root.mkdir(parents=True, exist_ok=True)
@@ -2334,6 +2427,7 @@ class WifiShare:
             threading.Thread(target=server.serve_forever,
                              kwargs={"poll_interval": 0.2}, daemon=True).start()
             self.server = server
+            self.error = None
             self.url = share_url(self.port, self.token)
         except OSError as exc:
             self.error = str(exc)[:26]
@@ -2343,6 +2437,7 @@ class WifiShare:
         if self.server is not None:
             try:
                 self.server.shutdown()
+                self.server.server_close()
             except Exception:
                 pass
         self.server = None
@@ -2361,20 +2456,33 @@ def draw_share_overlay(url, width=320, height=170, error=None):
         d.text((8, 88), "Check Wi-Fi is connected and", font=font(8), fill=(190, 210, 220))
         d.text((8, 102), "no other gallery server runs.", font=font(8), fill=(190, 210, 220))
         return image
+    host = url.split("//")[-1].split("/?")[0] if url else "no url"
+    offline = host.startswith("127.0.0.1:")
+    if offline:
+        d.text((8, 36), "NO WI-FI CONNECTION", font=font(12, True), fill=(255, 120, 140))
+        d.text((8, 58), "Connect Cardputer Zero to Wi-Fi,", font=font(9), fill=PAPER)
+        d.text((8, 74), "then press W again to refresh QR.", font=font(9), fill=PAPER)
+        d.text((8, 102), url[:44] if url else "", font=font(8), fill=(168, 190, 202))
+        return image
     qr = qr_image(url, box=height - 24) if url else None
     if qr is not None:
         image.paste(qr, (4, 20))
         left = qr.width + 12
+        d.text((left, 22), "SCAN TO DOWNLOAD", font=font(13, True), fill=MINT)
+        d.text((left, 41), host, font=font(13, True), fill=PAPER)
+        y = 68
+        for line in ("phone on Wi-Fi", "scan a photo", "save or share"):
+            d.text((left, y), line, font=font(13), fill=(206, 224, 232))
+            y += 20
+        d.text((left, y + 1), "token protected", font=font(10), fill=(168, 190, 202))
     else:
-        left = 8
-    host = url.split("//")[-1].split("/?")[0] if url else "no url"
-    d.text((left, 22), "SCAN TO DOWNLOAD", font=font(13, True), fill=MINT)
-    d.text((left, 41), host, font=font(13, True), fill=PAPER)
-    y = 68
-    for line in ("phone on Wi-Fi", "scan a photo", "save or share"):
-        d.text((left, y), line, font=font(13), fill=(206, 224, 232))
-        y += 20
-    d.text((left, y + 1), "token protected", font=font(10), fill=(168, 190, 202))
+        d.text((8, 24), "OPEN URL ON PHONE (NO QR PKG)", font=font(10, True), fill=MINT)
+        full = url or "no url"
+        d.text((8, 46), full[:42], font=font(9, True), fill=PAPER)
+        if len(full) > 42:
+            d.text((8, 62), full[42:84], font=font(9, True), fill=PAPER)
+        d.text((8, 92), "Install QR support: sudo apt install python3-qrcode",
+               font=font(8), fill=(168, 190, 202))
     return image
 
 
@@ -2611,6 +2719,7 @@ class Gallery:
                 self.pending_delete = None
                 self.seq += 1
                 return False
+            _cleanup_orphan_frames(path)
             self.items = [item for item in self.items if item != path]
             self.pending_delete = None
             self.index = min(self.index, max(0, len(self.items) - 1))
@@ -2766,6 +2875,23 @@ def draw_gallery(scene, gallery, width=320, height=170):
     return image
 
 
+def _cleanup_orphan_frames(deleted_path):
+    """Remove per-session raw frame dirs once their exported MP4/GIF is deleted."""
+    name = deleted_path.stem
+    root = deleted_path.parents[1] if len(deleted_path.parents) > 1 else ROOT
+    if name.startswith("lapse_"):
+        folder = deleted_path.parent / name
+        if folder.is_dir() and not folder.is_symlink():
+            shutil.rmtree(folder, ignore_errors=True)
+    elif name.startswith("stopmotion_"):
+        stamp = name[len("stopmotion_"):]
+        mp4 = root / "StopMotion" / f"stopmotion_{stamp}.mp4"
+        gif = root / "GIFs" / f"stopmotion_{stamp}.gif"
+        folder = root / "StopMotion" / f"frames_{stamp}"
+        if not mp4.exists() and not gif.exists() and folder.is_dir() and not folder.is_symlink():
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 def get_keyboards():
     if list_devices is None:
         return []
@@ -2780,8 +2906,13 @@ def get_keyboards():
                 dev.close()
         except (OSError, PermissionError):
             continue
-    # Favor Cardputer's TCA8418 keyboard; avoid stealing unrelated USB devices.
+    # Favor Cardputer's TCA8418 keyboard; close unused device handles to avoid FD leaks.
     found.sort(key=lambda d: ("tca8418" not in d.name.lower(), d.path))
+    for extra in found[1:]:
+        try:
+            extra.close()
+        except OSError:
+            pass
     return found[:1]
 
 
@@ -2880,7 +3011,7 @@ class LookPicker:
     ROW_H = 18
 
     def __init__(self, current="NORMAL", frame=None):
-        self.looks = list(FILTERS)
+        self.looks = list(refresh_filters())
         self.index = self.looks.index(current) if current in self.looks else 0
         self.offset = 0
         self.frame = frame
@@ -2907,7 +3038,7 @@ class LookPicker:
         if not value.startswith(LUT_PREFIX):
             return value
         name = value[len(LUT_PREFIX):]
-        for brand in ("kodak_", "fuji_", "agfa_", "ilford_", "lomography_", "cinestill_"):
+        for brand in ("look_", "kodak_", "fuji_", "agfa_", "ilford_", "lomography_", "cinestill_"):
             if name.startswith(brand):
                 name = name[len(brand):]
                 break
@@ -3017,12 +3148,7 @@ def draw_ui(scene, mode="PHOTO", style="NORMAL", resolution="8MP", status="READY
     viewfinder remains as wide as v0.5.1, preserving full-sensor framing.
     """
     if style.startswith(LUT_PREFIX):
-        name = style[len(LUT_PREFIX):]
-        for brand in ("kodak_", "fuji_", "agfa_", "ilford_", "lomography_", "cinestill_"):
-            if name.startswith(brand):
-                name = name[len(brand):]
-                break
-        style = "LUT " + name.replace("_", " ")[:18]
+        style = LookPicker.label(style)[:22]
     image = Image.new("RGB", (width, height), (10, 16, 25))
     panel_w = 26 if clean else (99 if width >= 290 else max(74, width//3))
     panel_x = width - panel_w
@@ -3147,6 +3273,7 @@ class FilmBoxUI:
         self.picker = None
         self.help_open = False
         self.film_busy = False
+        self.film_worker = None
         self._cam_error_seen = None
         self._cam_err_streak = 0
         self._cam_ok_streak = 0
@@ -3189,11 +3316,14 @@ class FilmBoxUI:
         self.status_deadline = time.monotonic() + delay
 
     def film_job(self, original, look):
-        """Render the filter copy in its own thread."""
+        """Render the filter copy in its own thread, serialized to protect RAM and camera state."""
+        if self.film_busy:
+            self.set_status("FILM BUSY - ONE AT A TIME", 4)
+            return
+        self.film_busy = True
         if not look.startswith(LUT_PREFIX):
-            # Built-in filters are one Pillow call (well under a second): no
-            # need to freeze the viewfinder or show a percentage that would
-            # jump straight from 0 to 100.
+            # Built-in filters run at bounded resolution: no need to freeze the viewfinder,
+            # while still serializing with film_busy so rapid bursts cannot OOM 512 MB RAM.
             def quick():
                 try:
                     filtered_still(original, look)
@@ -3202,18 +3332,17 @@ class FilmBoxUI:
                     with camera_log() as log:
                         log.write(f"FilmBox filter error: {type(exc).__name__}: {exc}\n".encode())
                     self.set_status("FILTER ERR " + str(exc)[:24], 8)
-            threading.Thread(target=quick, daemon=True).start()
+                finally:
+                    self.film_busy = False
+            self.film_worker = threading.Thread(target=quick, daemon=True)
+            self.film_worker.start()
             return
-        if self.film_busy:
-            self.set_status("FILM BUSY - ONE AT A TIME", 4)
-            return
-        self.film_busy = True
         was_live = bool(getattr(self.stream, "running", False))
         want = RESOLUTION_LABELS[self.settings.get("resolution", 0)]
         # The viewfinder is about to be frozen, which frees ~16 MB, so a frame
         # that looks tight right now may still make full resolution.
         tight = available_mb() < 130 and self.settings.get("resolution", 0) == 0
-        label = (look.replace(LUT_PREFIX, "") + "  " + want +
+        label = (LookPicker.label(look) + "  " + want +
                  ("  (LOW MEM -> 2MP)" if tight else ""))
         self.film_progress = 0
         self.film_label = label
@@ -3247,12 +3376,13 @@ class FilmBoxUI:
             finally:
                 self.film_progress = None
                 self.film_busy = False
-                if was_live:
+                if was_live and self.running and self.gallery is None and self.timelapse is None:
                     try:
                         self.stream.start()
                     except Exception:
                         pass
-        threading.Thread(target=render, daemon=True).start()
+        self.film_worker = threading.Thread(target=render, daemon=True)
+        self.film_worker.start()
 
     def do_photo(self):
         def operation():
@@ -3289,6 +3419,8 @@ class FilmBoxUI:
     def do_stopmotion_frame(self):
         if self.stopmotion is None:
             self.stopmotion = StopMotionSession(self.settings["filter"])
+        else:
+            self.stopmotion.look = self.settings["filter"]
         seq, jpg = self.stream.latest()
         try:
             self.stopmotion.capture(jpg)
@@ -3301,6 +3433,7 @@ class FilmBoxUI:
         if self.stopmotion is None or len(self.stopmotion.frames) < 2:
             self.set_status("NEED AT LEAST 2 FRAMES", 4)
             return
+        self.stopmotion.look = self.settings["filter"]
         session = self.stopmotion
         def operation():
             path = session.export()
@@ -3313,7 +3446,8 @@ class FilmBoxUI:
         self.timelapse = TimelapseCapture(interval=interval,
                     resolution=RESOLUTIONS[self.settings["resolution"]],
                     rotation=self.settings["rotation"],
-                    look=self.settings["filter"])
+                    look=self.settings["filter"],
+                    zoom=self.settings.get("zoom", 1.0))
         session = self.timelapse
         def capture_progress(n, exporting=False):
             if exporting:
@@ -3402,11 +3536,13 @@ class FilmBoxUI:
         if self.recording is not None:
             self.set_status("STOP VIDEO FIRST", 3)
             return
-        if self.busy:
+        if self.busy or self.film_busy:
             if self.timelapse_exporting:
                 self.set_status("EXPORTING MP4 - PLEASE WAIT", float("inf"))
             elif self.timelapse is not None:
                 self.set_status("STOP TIMELAPSE FIRST", 4)
+            elif self.film_busy:
+                self.set_status("RENDERING FILM - PLEASE WAIT", 4)
             else:
                 self.set_status("BUSY - PLEASE WAIT", 4)
             return
@@ -3438,7 +3574,9 @@ class FilmBoxUI:
     def open_picker(self, target_lut=False):
         frame = None
         if self.preview is not None and self.display is not None:
-            frame = preview_size(self.preview, (self.display.w - 96, self.display.h))
+            pw = max(64, self.display.w - 168)
+            ph = max(64, self.display.h - 20)
+            frame = fill_size(self.preview, (pw, ph))
         self.picker = LookPicker(self.settings["filter"], frame)
         if target_lut and not self.picker.jump_lut():
             self.picker = None
@@ -3448,6 +3586,16 @@ class FilmBoxUI:
         if self.help_open:
             if code in (ecodes.KEY_H, ecodes.KEY_ESC, ecodes.KEY_Q):
                 self.help_open = False
+            return
+        # While 8MP film LUT render freezes the viewfinder (stream stopped), block
+        # actions that would touch the stopped camera or terminate mid-render.
+        if self.film_progress is not None:
+            if code == ecodes.KEY_H:
+                self.help_open = True
+            elif code in (ecodes.KEY_8, ecodes.KEY_S):
+                self.settings["sound"] = not self.settings["sound"]
+                self.touch_settings()
+                click(self.settings["sound"])
             return
         if self.picker is not None:
             if code in (ecodes.KEY_ESC, ecodes.KEY_Q, ecodes.KEY_5, ecodes.KEY_F):
@@ -3519,8 +3667,10 @@ class FilmBoxUI:
             self.enter_gallery()
             return
         if code in (ecodes.KEY_ESC, ecodes.KEY_Q):
-            if not self.busy:
+            if not self.busy and not self.film_busy:
                 self.running = False
+            elif self.film_busy:
+                self.set_status("SAVING FILTER - PLEASE WAIT", 3)
             return
         if self.busy:
             return
@@ -3603,7 +3753,23 @@ class FilmBoxUI:
             self.touch_settings()
             click(self.settings["sound"])
 
+    def _warm_gpu(self):
+        """Initialise EGL in the background so the first shot is not slow."""
+        try:
+            _gpu_ready(1, max(available_mb(), 200))
+        except Exception:
+            pass
+
     def run(self, gallery_only=False):
+        # EGL contexts cannot be created from a worker thread on this driver, so
+        # initialise once here (2.7 s at startup); every later render happens on
+        # a worker thread that only has to make the context current.
+        if _ACCEL in ("auto", "gpu") and not gallery_only:
+            try:
+                _gpu_ready(1, max(available_mb(), 200))
+            except Exception:
+                pass
+
         def _shutdown(signum, frame):
             self.running = False
 
@@ -3695,6 +3861,17 @@ class FilmBoxUI:
                         last_status = menu_state
                     time.sleep(0.03)
                     continue
+                if self.film_progress is not None:
+                    film_state = ("film", self.film_progress, self.film_label)
+                    if film_state != last_status or now - last_draw > 0.25:
+                        self.safe_draw(draw_film_overlay(self.film_progress, self.film_label,
+                                                         width=self.display.w, height=self.display.h),
+                                       "film")
+                        last_draw = now
+                        last_status = film_state
+                    self.flush_settings()
+                    time.sleep(0.03)
+                    continue
                 if self.status != "REC" and not self.busy and now > self.status_deadline:
                     self.status = "READY"
                 self.flush_settings()
@@ -3712,13 +3889,13 @@ class FilmBoxUI:
                     self.fps = self.frame_counter / max(.001, now - self.fps_time)
                     self.frame_counter = 0
                     self.fps_time = now
-                if self.status == "REC" and self.recording and self.recording.proc and self.recording.proc.poll() is not None:
-                    self.set_status("ERR recorder stopped; press ENTER", 6)
                 # Only redraw when the camera provides a frame or UI state changes.
                 # While recording, draw clock twice a second, not 8x unnecessarily.
                 state = (self.status, self.mode, self.settings["filter"],
                          self.settings["resolution"], self.settings["video"],
-                         self.settings["timelapse_interval"], self.settings["sound"])
+                         self.settings["timelapse_interval"], self.settings["sound"],
+                         self.settings.get("clean_ui", False), self.settings.get("zoom", 1.0),
+                         len(self.stopmotion.frames) if self.stopmotion else 0)
                 if not new_frame and state == last_status and now - last_draw < (0.5 if self.recording else 1.0):
                     time.sleep(0.012)
                     continue
@@ -3726,7 +3903,7 @@ class FilmBoxUI:
                 last_status = state
                 mode = self.mode
                 style = self.settings["filter"]
-                if self.preview is not None and self.status != "REC":
+                if self.preview is not None and self.recording is None:
                     # Filter only LCD-size frames. 15 FPS is a target, not guaranteed.
                     scene = fill_size(self.preview, (self.display.w, self.display.h))
                     if mode == "STOPMOTION" and self.stopmotion is not None:
@@ -3751,12 +3928,6 @@ class FilmBoxUI:
                              if mode == "PHOTO" else "15F/2S")
                 elapsed = int(now - self.recording.started) if self.recording and self.recording.started else 0
                 live_status = "REC" if self.recording is not None else self.status
-                if self.film_progress is not None:
-                    frame_image = draw_film_overlay(self.film_progress, self.film_label,
-                                                    width=self.display.w, height=self.display.h)
-                    self.safe_draw(frame_image, "film")
-                    time.sleep(0.08)
-                    continue
                 frame_image = draw_ui(scene, mode, style, label,
                         live_status, self.settings["sound"], elapsed,
                         width=self.display.w, height=self.display.h, fps=self.fps,
@@ -3765,6 +3936,10 @@ class FilmBoxUI:
                 self.safe_draw(frame_image, "camera")
                 time.sleep(0.008)
         finally:
+            self.flush_settings(force=True)
+            if self.share is not None:
+                self.share.stop()
+                self.share = None
             if self.gallery is not None:
                 self.gallery.close()
                 self.gallery = None
@@ -3776,6 +3951,8 @@ class FilmBoxUI:
             self.stream.stop()
             if self.worker and self.worker.is_alive():
                 self.worker.join(timeout=15)
+            if self.film_worker and self.film_worker.is_alive():
+                self.film_worker.join(timeout=15)
             for dev in self.devices:
                 dev.close()
             if self.display:
@@ -3824,6 +4001,7 @@ def command_demo():
 
 
 def main(argv=None):
+    refresh_filters()
     parser = argparse.ArgumentParser(description="FilmBox for Cardputer Zero")
     parser.add_argument("command", nargs="?", choices=["ui", "gallery", "photo", "gif", "video", "timelapse", "boomerang", "web", "demo", "diagnose", "config"], default="ui")
     parser.add_argument("--filter", choices=FILTERS, default="NORMAL")
@@ -3833,7 +4011,7 @@ def main(argv=None):
     parser.add_argument("--rotation", type=int, choices=(0, 180), default=None,
                         help="Photo, GIF and video orientation (0 or 180)")
     parser.add_argument("--lut-full", choices=["on", "off"], default=None,
-                        help="Film copy at full 8MP (on) or 2MP (off, default)")
+                        help="Film copy at full 8MP (on, default) or 2MP (off)")
     parser.add_argument("--preview-fps", type=int, choices=(12, 15, 20, 24, 25, 30), default=None,
                         help="Set preview target FPS with the config command")
     parser.add_argument("--video-quality", choices=("wide", "720p", "1080p", "480p"), default="wide")
@@ -3871,7 +4049,8 @@ def main(argv=None):
             return 0
         if args.command == "photo":
             dims = tuple(map(int, args.resolution.split("x")))
-            original, filtered = take_photo(args.filter, dims, not args.no_sound, rotation)
+            full_res = settings.get("lut_full_res", True) if args.lut_full is None else (args.lut_full == "on")
+            original, filtered = take_photo(args.filter, dims, not args.no_sound, rotation, full_res=full_res)
             print("Original:", original)
             if filtered:
                 print("Filtered:", filtered)
@@ -3893,7 +4072,8 @@ def main(argv=None):
                 parser.error("Timelapse --interval 2..1800; --frames 1..20000; --fps 1..30")
             session = TimelapseCapture(interval=args.interval,
                          resolution=tuple(map(int,args.resolution.split("x"))),
-                         rotation=rotation, look=args.filter, fps=args.fps)
+                         rotation=rotation, look=args.filter, fps=args.fps,
+                         zoom=settings.get("zoom", 1.0))
             path = session.run(count=args.frames, progress=lambda n,exporting=False:
                     print("Encoding MP4..." if exporting else f"Captured {n}/{args.frames}",flush=True))
             print("Timelapse MP4:",path,"Original frames:",session.folder)
