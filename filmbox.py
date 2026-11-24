@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import lru_cache
 import array
 import fcntl
+import gc
 import io
 import json
 import mmap
@@ -52,7 +53,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.8.4"
+VERSION = "0.8.6"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -262,6 +263,26 @@ GRAY_PALETTE = _palette(GRAY_COLORS)
 
 
 _LUT_CACHE = {}
+
+
+_LIBC = None
+
+
+def reclaim_memory():
+    """Give freed Pillow buffers back to the kernel.
+
+    CPython + glibc keep released 24 MB image buffers inside the heap, so a
+    burst of shots slowly starves the CMA allocator. malloc_trim(0) releases
+    that free arena memory immediately.
+    """
+    global _LIBC
+    gc.collect()
+    try:
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        _LIBC.malloc_trim(0)
+    except Exception:
+        pass
 
 
 def mem_snapshot():
@@ -1393,6 +1414,7 @@ def filtered_still(original, mode, progress=None, full_res=None):
         result.save(path)
     if progress:
         progress(100)
+    reclaim_memory()
     return path
 
 
@@ -1645,6 +1667,25 @@ class CameraStream:
 
     def capture_still(self, path, resolution=None):
         limit = resolution or SENSOR_SIZE
+        # Bursts of 8 MP shots can outrun the CMA pool: a capture then fails with
+        # ENOMEM. Back off once, then step the sensor resolution down.
+        last = None
+        for attempt in range(4):
+            try:
+                return self._capture_once(path, limit)
+            except OSError as exc:
+                last = exc
+                if getattr(exc, "errno", None) != 12:
+                    raise
+                with camera_log() as log:
+                    log.write(("FilmBox capture ENOMEM try %d | %s\n"
+                               % (attempt + 1, mem_snapshot())).encode())
+                self._restore_preview()
+                reclaim_memory()
+                time.sleep(0.4 + 0.3 * attempt)
+        raise last
+
+    def _capture_once(self, path, limit):
         scale = min(1.0, limit[0] / SENSOR_SIZE[0], limit[1] / SENSOR_SIZE[1])
         size = (int(SENSOR_SIZE[0] * scale) // 2 * 2,
                 int(SENSOR_SIZE[1] * scale) // 2 * 2)
@@ -3217,6 +3258,7 @@ class FilmBoxUI:
         def operation():
             # The stream owns the camera now; capture_still switches config
             # internally and hands the live view straight back.
+            reclaim_memory()
             original = reserve_path("Photos", "8mp" if self.settings["resolution"] == 0
                                     else "photo", "jpg")
             click(self.settings["sound"])
