@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.8.2"
+VERSION = "0.8.4"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -2953,18 +2953,17 @@ def draw_film_overlay(percent, label="", width=320, height=170):
     """Full-screen film-copy screen: the viewfinder is frozen while rendering."""
     image = Image.new("RGB", (width, height), (6, 10, 16))
     d = ImageDraw.Draw(image)
-    d.text((10, 10), "FILM COPY", font=font(12, True), fill=MINT)
+    d.text((10, 8), "FILM COPY", font=font(14, True), fill=MINT)
     if label:
-        d.text((10, 28), label[:34], font=font(9), fill=(170, 196, 208))
-    bar_x, bar_y, bar_w = 10, 62, width - 20
-    d.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + 12), 6,
+        d.text((10, 30), label[:30], font=font(12), fill=(186, 210, 222))
+    bar_x, bar_y, bar_w = 10, 60, width - 20
+    d.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + 14), 7,
                         fill=(22, 32, 44), outline=(40, 62, 74), width=1)
     filled = max(0, min(100, percent)) * bar_w // 100
     if filled:
-        d.rounded_rectangle((bar_x, bar_y, bar_x + filled, bar_y + 12), 6, fill=MINT)
-    d.text((10, 84), "%d%%" % percent, font=font(16, True), fill=PAPER)
-    d.text((10, height - 26), "viewfinder frozen - this keeps the 8MP copy", font=font(7),
-           fill=(120, 146, 160))
+        d.rounded_rectangle((bar_x, bar_y, bar_x + filled, bar_y + 14), 7, fill=MINT)
+    d.text((10, 82), "%d%%" % percent, font=font(22, True), fill=PAPER)
+    d.text((10, height - 24), "viewfinder frozen", font=font(10), fill=(140, 168, 182))
     return image
 
 
@@ -3149,7 +3148,21 @@ class FilmBoxUI:
         self.status_deadline = time.monotonic() + delay
 
     def film_job(self, original, look):
-        """8MP film render in its own thread: viewfinder keeps running."""
+        """Render the filter copy in its own thread."""
+        if not look.startswith(LUT_PREFIX):
+            # Built-in filters are one Pillow call (well under a second): no
+            # need to freeze the viewfinder or show a percentage that would
+            # jump straight from 0 to 100.
+            def quick():
+                try:
+                    filtered_still(original, look)
+                    self.set_status("SAVED +FILTER", 4)
+                except Exception as exc:
+                    with camera_log() as log:
+                        log.write(f"FilmBox filter error: {type(exc).__name__}: {exc}\n".encode())
+                    self.set_status("FILTER ERR " + str(exc)[:24], 8)
+            threading.Thread(target=quick, daemon=True).start()
+            return
         if self.film_busy:
             self.set_status("FILM BUSY - ONE AT A TIME", 4)
             return
