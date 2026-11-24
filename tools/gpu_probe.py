@@ -51,7 +51,8 @@ gl.glTexParameteri(0x0DE1, 0x2802, 0x812F)
 gl.glTexParameteri(0x0DE1, 0x2803, 0x812F)
 data = bytes(W * H * 3)
 t = time.perf_counter()
-gl.glTexImage2D(0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401,
+gl.glPixelStorei(0x0CF5, 1)
+gl.glTexImage2D(0x0DE1, 0, 0x1907, W, H, 0, 0x1907, 0x1401,
                 ctypes.c_char_p(data))
 gl.glFinish()
 print("upload 8MP RGB %.0f MB: %.3fs" % (len(data) / 1e6, time.perf_counter() - t))

@@ -80,12 +80,16 @@ _CUBE_CACHE = {}
 
 
 # ------------------------------------------------------------- glow (shared)
-def build_glow(image, threshold=210, strength=0.6):
-    """1/4-scale highlight glow, same maths as the CPU pipeline."""
+def build_glow(image, threshold=210, strength=0.6, monochrome=None):
+    """1/4-scale highlight glow, neutral on B&W stocks and warm on color."""
     rgb = image if image.mode == "RGB" else image.convert("RGB")
     w, h = rgb.size
     sw, sh = max(1, w // 4), max(1, h // 4)
     small = rgb.resize((sw, sh), Image.Resampling.BOX)
+    if monochrome is None and np is not None:
+        arr = np.asarray(small, dtype=np.int16)
+        monochrome = bool(np.max(np.abs(arr[:, :, 0] - arr[:, :, 1])) <= 1
+                          and np.max(np.abs(arr[:, :, 1] - arr[:, :, 2])) <= 1)
 
     def ramp(v):
         if v < threshold:
@@ -93,9 +97,12 @@ def build_glow(image, threshold=210, strength=0.6):
         return min(255, int((v - threshold) * 255 // (255 - threshold)))
 
     mask = small.convert("L").point(ramp)
-    glow = Image.merge("RGB", (mask,
-                               mask.point(lambda v: int(v * 0.72)),
-                               mask.point(lambda v: int(v * 0.42))))
+    if monochrome:
+        glow = Image.merge("RGB", (mask, mask, mask))
+    else:
+        glow = Image.merge("RGB", (mask,
+                                   mask.point(lambda v: int(v * 0.72)),
+                                   mask.point(lambda v: int(v * 0.42))))
     glow = glow.filter(ImageFilter.GaussianBlur(max(1.0, max(w, h) / 3200.0)))
     if strength != 1.0:
         glow = glow.point(lambda v: int(v * strength))
@@ -103,8 +110,8 @@ def build_glow(image, threshold=210, strength=0.6):
 
 
 # --------------------------------------------------------------------- GPU
-GL_RGB, GL_RGBA, GL_UBYTE = 0x1908, 0x1908, 0x1401
-GL_TEX2D, GL_LINEAR, GL_CLAMP = 0x0DE1, 0x2601, 0x812F
+GL_RGB, GL_RGBA, GL_UBYTE = 0x1907, 0x1908, 0x1401
+GL_TEX2D, GL_NEAREST, GL_LINEAR, GL_CLAMP = 0x0DE1, 0x2600, 0x2601, 0x812F
 GL_MIN_F, GL_MAG_F = 0x2801, 0x2800
 GL_WRAP_S, GL_WRAP_T = 0x2802, 0x2803
 GL_FBO, GL_COLOR_ATT, GL_FBO_OK = 0x8D40, 0x8CE0, 0x8CD5
@@ -126,15 +133,18 @@ uniform vec2 blockSize;      // pixels in this tile
 uniform vec2 blockOrigin;    // tile offset in the full image, pixels
 uniform vec2 imgSize;
 uniform float n;             // LUT edge (13 or 33)
-uniform float grainAmp;      // grey levels
+uniform float grainAmp;      // normalized grey amplitude (0..1)
 uniform float glowMix;       // 0 disables halation
+uniform vec2 uvScale;        // active content ratio vs allocated tile texture
 
 float hash(vec2 p){
-  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+  vec2 q = mod(floor(p), 251.0);
+  return fract((q.x * 17.31 + q.y * 43.17) * (q.x * 0.13 + q.y * 0.07 + 1.13));
 }
 
 void main(){
-  vec3 c = texture2D(tex, vUv).rgb;
+  vec2 uv = vUv * uvScale;
+  vec3 c = texture2D(tex, uv).rgb;
 
   // 3D LUT from a 2D atlas: x = b*n + r, y = g
   float b = clamp(c.b, 0.0, 1.0) * (n - 1.0);
@@ -156,10 +166,10 @@ void main(){
   // grain: full-image pixel coordinates keep tiles seamless
   if (grainAmp > 0.0) {
     vec2 px = blockOrigin + vUv * blockSize;
-    float n1 = hash(px) + hash(px + vec2(17.0, 31.0)) - 1.0;   // ±1
+    float n1 = (hash(px) + hash(px + vec2(17.0, 31.0))) * 0.5 * 2.0 - 1.0;
     float luma = dot(col, vec3(0.299, 0.587, 0.114));
     float w = clamp(1.35 - luma * 1.5, 0.15, 1.0);
-    col += n1 * grainAmp * w * 0.5;
+    col += n1 * grainAmp * w;
   }
   gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }"""
@@ -192,19 +202,54 @@ class GpuFilm:
         if not egl.eglMakeCurrent(dpy, ctypes.c_void_p(0), ctypes.c_void_p(0), ctx):
             raise RuntimeError("eglMakeCurrent")
         self.egl, self.gl = egl, gl
+        u, i, f, v = ctypes.c_uint, ctypes.c_int, ctypes.c_float, ctypes.c_void_p
+        gl.glTexImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
+        gl.glTexSubImage2D.argtypes = [u, i, i, i, i, i, u, u, v]
+        gl.glReadPixels.argtypes = [i, i, i, i, u, u, v]
+        gl.glDrawArrays.argtypes = [u, i, i]
+        gl.glViewport.argtypes = [i, i, i, i]
+        gl.glBindTexture.argtypes = [u, u]
+        gl.glBindFramebuffer.argtypes = [u, u]
+        gl.glFramebufferTexture2D.argtypes = [u, u, u, u, i]
+        gl.glTexParameteri.argtypes = [u, u, i]
+        gl.glPixelStorei.argtypes = [u, i]
+        gl.glActiveTexture.argtypes = [u]
+        gl.glUniform1i.argtypes = [i, i]
+        gl.glUniform1f.argtypes = [i, f]
+        gl.glUniform2f.argtypes = [i, f, f]
+        gl.glGetUniformLocation.argtypes = [u, ctypes.c_char_p]
+        gl.glGetUniformLocation.restype = i
         maxt = ctypes.c_int()
         gl.glGetIntegerv(0x0D33, ctypes.byref(maxt))
         self.maxt = maxt.value or 2048
+        self.tile = min(self.maxt, 512)
         self.renderer = (gl.glGetString(0x1F01) or b"").decode(errors="ignore")
         self.prog = self._program()
         self.lut_tex = None
         self.lut_key = None
-        self.tex, self.fb = ctypes.c_uint(), ctypes.c_uint()
-        gl.glGenTextures(1, ctypes.byref(self.tex))
+        self.src_tex, self.dst_tex, self.fb = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+        gl.glGenTextures(1, ctypes.byref(self.src_tex))
+        gl.glGenTextures(1, ctypes.byref(self.dst_tex))
         gl.glGenFramebuffers(1, ctypes.byref(self.fb))
+        gl.glActiveTexture(GL_TEXTURE0)
+        gl.glBindTexture(GL_TEX2D, self.src_tex)
+        gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_NEAREST)
+        gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_NEAREST)
+        gl.glTexParameteri(GL_TEX2D, GL_WRAP_S, GL_CLAMP)
+        gl.glTexParameteri(GL_TEX2D, GL_WRAP_T, GL_CLAMP)
+        gl.glPixelStorei(0x0CF5, 1)
+        gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, self.tile, self.tile, 0, GL_RGB, GL_UBYTE, None)
+        gl.glBindTexture(GL_TEX2D, self.dst_tex)
+        gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_NEAREST)
+        gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_NEAREST)
+        gl.glTexParameteri(GL_TEX2D, GL_WRAP_S, GL_CLAMP)
+        gl.glTexParameteri(GL_TEX2D, GL_WRAP_T, GL_CLAMP)
+        gl.glTexImage2D(GL_TEX2D, 0, GL_RGBA, self.tile, self.tile, 0, GL_RGBA, GL_UBYTE, None)
+        gl.glBindFramebuffer(GL_FBO, self.fb)
+        gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.dst_tex, 0)
         self.uniforms = {}
         for name in (b"tex", b"lut", b"glow", b"blockSize", b"blockOrigin",
-                     b"imgSize", b"n", b"grainAmp", b"glowMix"):
+                     b"imgSize", b"n", b"grainAmp", b"glowMix", b"uvScale"):
             self.uniforms[name.decode()] = gl.glGetUniformLocation(self.prog, name)
         quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
         self._quad = quad
@@ -259,6 +304,7 @@ class GpuFilm:
             gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
         for p in (GL_WRAP_S, GL_WRAP_T):
             gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+        gl.glPixelStorei(0x0CF5, 1)
         gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, size * size, size, 0, GL_RGB,
                         GL_UBYTE, ctypes.c_char_p(self._atlas(size, data)))
         self.lut_key = key
@@ -276,7 +322,12 @@ class GpuFilm:
         w, h = rgb.size
         gl = self.gl
         self._upload_lut(cube_path)
-        glow = build_glow(rgb) if halation else None
+        size, data, _ = read_cube(cube_path)
+        lut_obj = ImageFilter.Color3DLUT(size, [v / 255.0 for v in struct.unpack("B" * (size ** 3 * 3), data)])
+        glow = None
+        if halation:
+            sw, sh = max(1, w // 4), max(1, h // 4)
+            glow = build_glow(rgb.resize((sw, sh), Image.Resampling.BOX).filter(lut_obj))
         if glow is not None:
             if not hasattr(self, "glow_tex"):
                 self.glow_tex = ctypes.c_uint()
@@ -287,40 +338,42 @@ class GpuFilm:
                 gl.glTexParameteri(GL_TEX2D, p, GL_LINEAR)
             for p in (GL_WRAP_S, GL_WRAP_T):
                 gl.glTexParameteri(GL_TEX2D, p, GL_CLAMP)
+            gl.glPixelStorei(0x0CF5, 1)
             gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, glow.width, glow.height, 0,
                             GL_RGB, GL_UBYTE, ctypes.c_char_p(glow.tobytes()))
 
         gl.glUseProgram(self.prog)
         gl.glUniform1f(self.uniforms["n"], ctypes.c_float(self.lut_size))
-        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(max(0.0, grain)))
-        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(0.6 if halation else 0.0))
+        gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(max(0.0, grain) * 1.2 / 255.0))
+        gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(1.0 if glow is not None else 0.0))
         gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(w), ctypes.c_float(h))
 
         out = Image.new("RGB", (w, h))
-        tile = min(self.maxt, 2048)
+        tile = self.tile
+        buf = ctypes.create_string_buffer(tile * tile * 4)
+        gl.glBindFramebuffer(GL_FBO, self.fb)
+        gl.glActiveTexture(GL_TEXTURE0)
+        gl.glBindTexture(GL_TEX2D, self.src_tex)
+        gl.glPixelStorei(0x0CF5, 1)
         for top in range(0, h, tile):
             rows = min(tile, h - top)
             for left in range(0, w, tile):
                 cols = min(tile, w - left)
-                block = rgb.crop((left, top, left + cols, top + rows))
-                gl.glActiveTexture(GL_TEXTURE0)
-                gl.glBindTexture(GL_TEX2D, self.tex)
-                gl.glTexParameteri(GL_TEX2D, GL_MIN_F, GL_LINEAR)
-                gl.glTexParameteri(GL_TEX2D, GL_MAG_F, GL_LINEAR)
-                gl.glTexImage2D(GL_TEX2D, 0, GL_RGB, cols, rows, 0, GL_RGB,
-                                GL_UBYTE, ctypes.c_char_p(block.tobytes()))
-                gl.glBindFramebuffer(GL_FBO, self.fb)
-                gl.glFramebufferTexture2D(GL_FBO, GL_COLOR_ATT, GL_TEX2D, self.tex, 0)
+                raw = rgb.crop((left, top, left + cols, top + rows)).tobytes()
+                gl.glTexSubImage2D(GL_TEX2D, 0, 0, 0, cols, rows, GL_RGB,
+                                   GL_UBYTE, ctypes.c_char_p(raw))
                 gl.glViewport(0, 0, cols, rows)
                 gl.glUniform2f(self.uniforms["blockSize"],
                                ctypes.c_float(cols), ctypes.c_float(rows))
+                gl.glUniform2f(self.uniforms["uvScale"],
+                               ctypes.c_float(cols / float(tile)),
+                               ctypes.c_float(rows / float(tile)))
                 gl.glUniform2f(self.uniforms["blockOrigin"],
                                ctypes.c_float(left), ctypes.c_float(top))
                 gl.glDrawArrays(GL_STRIP, 0, 4)
-                buf = ctypes.create_string_buffer(cols * rows * 4)
                 gl.glReadPixels(0, 0, cols, rows, GL_RGBA, GL_UBYTE, buf)
-                part = Image.frombytes("RGBA", (cols, rows), buf.raw).convert("RGB")
-                out.paste(part.transpose(Image.Transpose.FLIP_TOP_BOTTOM), (left, top))
+                part = Image.frombytes("RGBA", (cols, rows), buf.raw[:cols * rows * 4]).convert("RGB")
+                out.paste(part, (left, top))
         return out
 
 

@@ -32,8 +32,8 @@ CameraStream
 
 ## 功能
 
-- **胶片 LUT**：`~/.config/cybercam/luts/*.cube`，`5` 打开选择器（内置滤镜 + LUT，右侧实时预览）
-- **胶片副本**：LUT → halation（高光光晕）→ grain（按亮度调制的颗粒）→ JPEG，原片保留
+- **胶片 LUT**：内置 `/usr/share/filmbox/luts/*.cube`（用户可在 `~/.config/filmbox/luts/*.cube` 新增或覆盖），`5` 打开选择器（内置滤镜 + LUT，右侧实时预览）
+- **胶片副本**：LUT → halation（彩色暖光晕 / 黑白银盐中性光晕）→ grain（按亮度调制的颗粒）→ JPEG，原片保留
 - **变焦**：`Z` 循环 1x/1.5x/2x/3x，照片按同样倍率软件裁切（不放大）
 - **扫码导出**：`W` 起局域网相册（token 保护）+ 全屏二维码，手机扫码下载
 - **相册删除**：`DEL` 两次确认
@@ -60,11 +60,10 @@ CameraStream
 ## 安装（设备上）
 
 ```bash
-scp -r . pi@<cpz>:~/
+scp -r . pi@<cpz>:~/cybercam
 ssh pi@<cpz> 'sh ~/cybercam/install.sh'
-# 或者直接装 deb：
-# deb 打包脚本在上游 CyberCam 仓库的 packaging/ 里（本仓库只放改造后的单文件）
-#   python3 packaging/make_package.py && sudo dpkg -i cybercam_0.5.3_all.deb
+# 或者在设备上直接打包安装 deb（Raspberry Pi OS 基于 Debian）：
+#   python3 packaging/make_package.py && sudo apt install -y ../filmbox_0.8.6_all.deb
 ```
 
 ## 自检
@@ -72,18 +71,19 @@ ssh pi@<cpz> 'sh ~/cybercam/install.sh'
 改完相机相关代码后，在设备上跑：
 
 ```bash
-python3 selftest.py     # 约 60 秒，覆盖启动/预览/四档变焦/8MP/录像/恢复
+python3 selftest.py     # 约 60 秒，覆盖启动/预览/四档变焦/8MP+1080P/录像/恢复
 ```
 
 ## 目录
 
 ```
-cybercam.py                 应用本体（单文件，Python）
-cybercam-film-share.patch   相对上游 v0.5.3 的 diff
+filmbox.py                  应用本体（单文件，Python，FilmBox 0.8.6）
+packaging/make_package.py   Debian / Raspberry Pi OS (.deb) 打包脚本
+tools/                      GPU (EGL/GLES2) / 多核加速实验与基准脚本
+cybercam-film-share.patch   早期相对上游 v0.5.3 的历史 diff
 selftest.py                 相机层自检
-install.sh                  一键安装（备份 + 覆盖 + 拷 LUT）
+install.sh                  一键安装（备份 + 安装 filmbox + 拷 LUT + 补齐依赖）
 luts/                       18 支 .cube + 说明
-tools/lutcompose.py         历史工具：两级 LUT 合成（不参与出包）
 icon-100.png                像素风图标（25×25 ×4）
 NOTES.md                    改动记录与踩坑
 ```
@@ -101,7 +101,7 @@ build_looks.py   Provia + 参数层 → luts/look_*.cube（只需仓库内文件
 |---|---|
 | `README.md` | 本文件：项目概览、实机数据、安装 |
 | `NOTES.md` | 改动记录 15 节（含每个坑的原因与修法） |
-| `REVIEW.md` / `REVIEW-2.md` / `REVIEW-3.md` | dsh 三轮审计报告（A/B/C/D/E 分级） |
+| `REVIEW.md` / `REVIEW-2.md` / `REVIEW-3.md` / `REVIEW-4.md` | 四轮代码审计与修复记录 |
 | `REVIEW-RESPONSE.md` | 第一轮的逐条处理记录 |
 | `luts/README.md` | 18 支 LUT 的来源与授权 |
 | `selftest.py` | 相机层自检（60 秒 7 项） |
