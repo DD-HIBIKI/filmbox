@@ -52,7 +52,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 
@@ -1339,8 +1339,22 @@ def filtered_still(original, mode, progress=None, full_res=None):
                 scale = min(limit[0] / image.width, limit[1] / image.height)
                 image = image.resize((int(image.width * scale), int(image.height * scale)),
                                      Image.Resampling.BOX)
-            result = film_copy(image, LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube"),
-                               progress, gpu_budget)
+            cube_file = LUT_DIR / (mode[len(LUT_PREFIX):] + ".cube")
+            try:
+                result = film_copy(image, cube_file, progress, gpu_budget)
+            except (MemoryError, OSError) as exc:
+                # An 8 MP render needs ~130 MB. Boot-time fragmentation can leave
+                # less than that even though the frame decoded fine, so retry once
+                # at 2 MP instead of failing the whole shot.
+                with camera_log() as log:
+                    log.write(("FilmBox memory fallback: %s\n" % exc).encode())
+                scale = min(LUT_SAVE_MAX[0] / image.width, LUT_SAVE_MAX[1] / image.height)
+                small = image.resize((max(1, int(image.width * scale)),
+                                      max(1, int(image.height * scale))),
+                                     Image.Resampling.BOX)
+                del image
+                image = small
+                result = film_copy(image, cube_file, progress, gpu_budget)
         else:
             result = filter_image(image, mode)
     if is_lut:
@@ -3244,10 +3258,11 @@ class FilmBoxUI:
                 with camera_log() as log:
                     log.write(f"FilmBox worker error: {type(exc).__name__}: {exc}\n".encode())
                 self.set_status("ERR " + str(exc)[:36], 12)
-                # Still camera may be stopped after a failed operation.
-                if self.stream.proc is None and self.recording is None:
+                # A failed render can leave the camera in its still configuration;
+                # start() returns early when picam exists, so force a restore.
+                if self.recording is None:
                     try:
-                        self.stream.start()
+                        self.stream._restore_preview()
                     except Exception:
                         pass
             finally:
