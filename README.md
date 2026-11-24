@@ -100,7 +100,8 @@ build_looks.py   Provia + 参数层 → luts/look_*.cube（只需仓库内文件
 | 文件 | 用途 |
 |---|---|
 | `README.md` | 本文件：项目概览、实机数据、安装 |
-| `NOTES.md` | 改动记录 15 节（含每个坑的原因与修法） |
+| `AGENTS.md` | 开发红线与防踩坑指南（Minis / 协作开发必读） |
+| `NOTES.md` | 改动记录 16 节（含每个坑的原因与修法） |
 | `REVIEW.md` / `REVIEW-2.md` / `REVIEW-3.md` / `REVIEW-4.md` | 四轮代码审计与修复记录 |
 | `REVIEW-RESPONSE.md` | 第一轮的逐条处理记录 |
 | `luts/README.md` | 18 支 LUT 的来源与授权 |
