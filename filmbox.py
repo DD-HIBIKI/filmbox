@@ -1374,6 +1374,339 @@ def _render_band(block, top, w, h, cube_path, glow, use_gpu):
     return add_grain(band, GRAIN_STRENGTH, seed=top)
 
 
+def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=None):
+    """Decode JPEG, apply GpuFilm with 2MP memory fallback, and save atomically."""
+    original = Path(original)
+    room_for_full = available_mb() >= 130
+    decode_mb = 24 if (want_full and room_for_full) else 6
+    gpu_budget = available_mb() - decode_mb
+    if gpu_budget < GPU_MIN_FREE_MB:
+        return None, "low_mem"
+    with Image.open(original) as handle:
+        if not (want_full and room_for_full):
+            try:
+                handle.draft("RGB", (LUT_SAVE_MAX[0] * 2, LUT_SAVE_MAX[1] * 2))
+            except Exception:
+                pass
+        image = handle.convert("RGB")
+    limit = None if (want_full and room_for_full) else LUT_SAVE_MAX
+    if limit and max(image.size) > max(limit):
+        scale = min(limit[0] / image.width, limit[1] / image.height)
+        image = image.resize((max(1, int(image.width * scale)),
+                              max(1, int(image.height * scale))),
+                             Image.Resampling.BOX)
+    if image.width * image.height > GPU_MAX_PIXELS:
+        return None, "too_large"
+    try:
+        result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH, progress=progress)
+    except (MemoryError, OSError) as exc:
+        with camera_log() as log:
+            log.write(("FilmBox GPU memory fallback: %s | %s\n"
+                       % (exc, mem_snapshot())).encode())
+        scale = min(LUT_SAVE_MAX[0] / image.width, LUT_SAVE_MAX[1] / image.height)
+        small = image.resize((max(1, int(image.width * scale)),
+                              max(1, int(image.height * scale))),
+                             Image.Resampling.BOX)
+        del image
+        image = small
+        result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH, progress=progress)
+    tag = "" if max(result.size) > max(LUT_SAVE_MAX) else "_%dmp" % round(
+        result.width * result.height / 1e6)
+    out_path = original.with_name(original.stem + "_" +
+                                  mode.replace(":", "-").lower() + tag + ".jpg")
+    _atomic_save_image(result, out_path, "JPEG", quality=93, subsampling=1)
+    del image, result
+    reclaim_memory()
+    return out_path, None
+
+
+def command_gpu_worker():
+    """Dedicated background GPU process: owns EGL on its own main thread.
+
+    Running EGL in a separate process lets the camera UI open the live
+    viewfinder immediately (zero 2-3 s cold-start stall), obeys Mesa/vc4's
+    main-thread EGL creation requirement, and isolates any driver crash.
+    """
+    try:
+        os.nice(5)
+    except (AttributeError, OSError):
+        pass
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+
+    def emit(payload):
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.stdout.flush()
+
+    try:
+        gpu = GpuFilm()
+    except Exception as exc:
+        emit({"event": "fail", "error": str(exc)})
+        return 1
+    emit({"event": "ready", "renderer": gpu.renderer, "maxt": gpu.maxt})
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            emit({"event": "error", "error": "bad request"})
+            continue
+        cmd = req.get("cmd")
+        if cmd == "quit":
+            break
+        if cmd != "render":
+            emit({"event": "error", "error": "unknown cmd"})
+            continue
+        try:
+            out_path, reason = _render_lut_with_gpu(
+                gpu,
+                req["original"],
+                req["mode"],
+                req["cube"],
+                bool(req.get("full_res", True)),
+                progress=lambda pct: emit({"event": "progress", "pct": int(pct)}),
+            )
+            if out_path is None:
+                emit({"event": "fallback", "reason": reason or "budget"})
+            else:
+                emit({"event": "done", "path": str(out_path)})
+        except Exception as exc:
+            emit({"event": "error", "error": "%s: %s" % (type(exc).__name__, exc)})
+    return 0
+
+
+class GpuWorker:
+    """Async controller for the background `_gpu-worker` helper process."""
+
+    def __init__(self, script_path=None):
+        self.script_path = str(script_path or Path(__file__).resolve())
+        self.proc = None
+        self.reader = None
+        self.state = "idle"     # idle | warming | ready | failed | stopped
+        self.renderer = ""
+        self.maxt = 0
+        self.error = None
+        self._cond = threading.Condition()
+        self._job_lock = threading.Lock()
+        self._progress_cb = None
+        self._job_result = None
+
+    def start(self):
+        with self._cond:
+            if self.state in ("warming", "ready"):
+                return
+            self.state = "warming"
+            self.error = None
+        log_fh = None
+        try:
+            log_fh = camera_log()
+            self.proc = subprocess.Popen(
+                [sys.executable, "-u", self.script_path, "_gpu-worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=log_fh,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            with self._cond:
+                self.state = "failed"
+                self.error = str(exc)
+                self._cond.notify_all()
+            return
+        finally:
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+
+    def is_warming(self):
+        with self._cond:
+            return self.state == "warming"
+
+    def is_ready(self):
+        with self._cond:
+            return self.state == "ready"
+
+    def _read_loop(self):
+        proc = self.proc
+        try:
+            assert proc is not None and proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                ev = msg.get("event")
+                if ev == "progress":
+                    cb = self._progress_cb
+                    if cb is not None:
+                        try:
+                            cb(int(msg.get("pct", 0)))
+                        except Exception:
+                            pass
+                    continue
+                with self._cond:
+                    if ev == "ready":
+                        self.state = "ready"
+                        self.renderer = str(msg.get("renderer", ""))
+                        self.maxt = int(msg.get("maxt", 0))
+                        with camera_log() as log:
+                            log.write(("FilmBox accel: GPU worker ready (%s, max tex %d)\n"
+                                       % (self.renderer, self.maxt)).encode())
+                    elif ev == "fail":
+                        self.state = "failed"
+                        self.error = str(msg.get("error", "init failed"))
+                        with camera_log() as log:
+                            log.write(("FilmBox accel: GPU worker unavailable (%s)\n"
+                                       % self.error).encode())
+                    elif ev in ("done", "error", "fallback"):
+                        self._job_result = msg
+                    self._cond.notify_all()
+        except Exception as exc:
+            with self._cond:
+                if self.state != "stopped":
+                    self.state = "failed"
+                    self.error = str(exc)
+                if self._job_result is None:
+                    self._job_result = {"event": "error", "error": str(exc)}
+                self._cond.notify_all()
+        finally:
+            with self._cond:
+                if self.state not in ("stopped", "failed"):
+                    self.state = "failed"
+                    self.error = self.error or "GPU worker exited"
+                if self._job_result is None:
+                    self._job_result = {"event": "error", "error": "GPU worker exited"}
+                self._cond.notify_all()
+
+    def render(self, original, mode, cube_path, full_res=True, progress=None,
+               on_status=None, wait_timeout=10.0, render_timeout=60.0):
+        """Render a LUT copy in the background GPU worker.
+
+        If the worker is still warming up on the first shot, notifies the UI
+        via `on_status` and waits up to `wait_timeout` seconds. Returns a Path
+        on success, or None to let the caller fall back seamlessly to CPU.
+        """
+        with self._job_lock:
+            with self._cond:
+                if self.state == "warming":
+                    if on_status is not None:
+                        on_status("LOADING GPU... (FIRST SHOT)")
+                    deadline = time.monotonic() + wait_timeout
+                    while self.state == "warming":
+                        rem = deadline - time.monotonic()
+                        if rem <= 0:
+                            break
+                        self._cond.wait(timeout=rem)
+                    if self.state == "warming":
+                        with camera_log() as log:
+                            log.write(b"FilmBox accel: GPU worker warm-up timed out; falling back to CPU\n")
+                        if on_status is not None:
+                            on_status("GPU BUSY -> CPU RENDER")
+                        return None
+                if self.state != "ready" or self.proc is None or self.proc.stdin is None:
+                    if on_status is not None and self.state == "failed":
+                        on_status("GPU UNAVAILABLE -> CPU")
+                    return None
+                self._job_result = None
+                self._progress_cb = progress
+                if on_status is not None:
+                    on_status("GPU RENDERING")
+            req = {
+                "cmd": "render",
+                "original": str(original),
+                "mode": mode,
+                "cube": str(cube_path),
+                "full_res": bool(full_res),
+            }
+            try:
+                self.proc.stdin.write(json.dumps(req) + "\n")
+                self.proc.stdin.flush()
+            except OSError as exc:
+                with self._cond:
+                    self._progress_cb = None
+                    self.state = "failed"
+                    self.error = str(exc)
+                if on_status is not None:
+                    on_status("GPU LOST -> CPU RENDER")
+                return None
+            with self._cond:
+                deadline = time.monotonic() + render_timeout
+                while self._job_result is None and self.state == "ready":
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        break
+                    self._cond.wait(timeout=rem)
+                result = self._job_result
+                self._progress_cb = None
+            if not result:
+                with camera_log() as log:
+                    log.write(b"FilmBox accel: GPU worker render timed out\n")
+                self.stop()
+                if on_status is not None:
+                    on_status("GPU TIMEOUT -> CPU")
+                return None
+            if result.get("event") == "done":
+                return Path(result["path"])
+            with camera_log() as log:
+                log.write(("FilmBox accel: GPU worker fallback (%s)\n"
+                           % (result.get("error") or result.get("reason") or "unknown")).encode())
+            if on_status is not None:
+                on_status("CPU FALLBACK")
+            return None
+
+    def stop(self):
+        with self._cond:
+            self.state = "stopped"
+            self._cond.notify_all()
+        proc = self.proc
+        self.proc = None
+        if proc is not None:
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    try:
+                        proc.stdin.write('{"cmd":"quit"}\n')
+                        proc.stdin.flush()
+                    except OSError:
+                        pass
+                    proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+        reader = self.reader
+        self.reader = None
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=1.5)
+
+
 def _atomic_save_image(image, path, fmt=None, **kwargs):
     """Write image to a hidden temp file first so interrupted saves never appear in Gallery."""
     path = Path(path)
@@ -3154,7 +3487,7 @@ def draw_help(width=320, height=170):
     return image
 
 
-def draw_film_overlay(percent, label="", width=320, height=170):
+def draw_film_overlay(percent, label="", width=320, height=170, note=""):
     """Full-screen film-copy screen: the viewfinder is frozen while rendering."""
     image = Image.new("RGB", (width, height), (6, 10, 16))
     d = ImageDraw.Draw(image)
@@ -3168,6 +3501,9 @@ def draw_film_overlay(percent, label="", width=320, height=170):
     if filled:
         d.rounded_rectangle((bar_x, bar_y, bar_x + filled, bar_y + 14), 7, fill=MINT)
     d.text((10, 82), "%d%%" % percent, font=font(22, True), fill=PAPER)
+    if note:
+        note_color = MINT if note == "GPU RENDERING" else (250, 195, 95)
+        d.text((10, 114), note[:34], font=font(11, True), fill=note_color)
     d.text((10, height - 24), "viewfinder frozen", font=font(10), fill=(140, 168, 182))
     return image
 
@@ -3307,11 +3643,13 @@ class FilmBoxUI:
         self.help_open = False
         self.film_busy = False
         self.film_worker = None
+        self.gpu_worker = None
         self._cam_error_seen = None
         self._cam_err_streak = 0
         self._cam_ok_streak = 0
         self.film_progress = None
         self.film_label = ""
+        self.film_note = ""
         self._settings_dirty = False
         self._settings_flushed = 0.0
         self.frame_counter = 0
@@ -3379,9 +3717,17 @@ class FilmBoxUI:
                  ("  (LOW MEM -> 2MP)" if tight else ""))
         self.film_progress = 0
         self.film_label = label
+        self.film_note = (
+            "LOADING GPU... (FIRST SHOT)"
+            if (self.gpu_worker is not None and self.gpu_worker.is_warming())
+            else ""
+        )
 
         def on_progress(percent):
             self.film_progress = max(0, min(100, percent))
+
+        def on_note(text):
+            self.film_note = text
 
         def render():
             try:
@@ -3392,8 +3738,22 @@ class FilmBoxUI:
                         self.stream.stop()
                     except Exception:
                         pass
-                output_path = filtered_still(original, look, progress=on_progress,
-                                             full_res=self.settings.get("lut_full_res", False))
+                full_res = self.settings.get("lut_full_res", True)
+                output_path = None
+                if (self.gpu_worker is not None
+                        and os.environ.get("FILMBOX_STREAM", "0") != "1"):
+                    cube_file = resolve_lut_path(look[len(LUT_PREFIX):])
+                    output_path = self.gpu_worker.render(
+                        original, look, cube_file,
+                        full_res=full_res,
+                        progress=on_progress,
+                        on_status=on_note,
+                    )
+                    if output_path is not None:
+                        on_progress(100)
+                if output_path is None:
+                    output_path = filtered_still(original, look, progress=on_progress,
+                                                 full_res=full_res)
                 output_name = output_path.name if output_path is not None else ""
                 try:
                     with Image.open(original.with_name(output_name)) as probe:
@@ -3408,6 +3768,7 @@ class FilmBoxUI:
                 self.set_status("FILM ERR " + str(exc)[:26], 10)
             finally:
                 self.film_progress = None
+                self.film_note = ""
                 self.film_busy = False
                 if was_live and self.running and self.gallery is None and self.timelapse is None:
                     try:
@@ -3803,8 +4164,9 @@ class FilmBoxUI:
             if gallery_only:
                 self.gallery = Gallery()
             else:
-                # Light up the LCD immediately (<50 ms), then start the camera so
-                # sensor/ISP warm-up runs concurrently with main-thread EGL setup.
+                # Light up the LCD immediately (<50 ms), spawn the GPU worker in
+                # the background (its own process main thread owns EGL), and go
+                # straight into the live viewfinder without a 2-3 s GPU stall.
                 self.safe_draw(draw_ui(
                     None, self.mode, self.settings["filter"],
                     RESOLUTION_LABELS[self.settings["resolution"]],
@@ -3812,12 +4174,10 @@ class FilmBoxUI:
                     width=self.display.w, height=self.display.h, fps=0,
                     clean=self.settings.get("clean_ui", False),
                     zoom=self.settings.get("zoom", 1.0)), "boot")
-                self.stream.start()
                 if _ACCEL in ("auto", "gpu"):
-                    try:
-                        _gpu_ready(1, max(available_mb(), 200))
-                    except Exception:
-                        pass
+                    self.gpu_worker = GpuWorker()
+                    self.gpu_worker.start()
+                self.stream.start()
             last_draw = 0.0
             last_status = None
             while self.running:
@@ -3893,10 +4253,11 @@ class FilmBoxUI:
                     time.sleep(0.03)
                     continue
                 if self.film_progress is not None:
-                    film_state = ("film", self.film_progress, self.film_label)
+                    film_state = ("film", self.film_progress, self.film_label, self.film_note)
                     if film_state != last_status or now - last_draw > 0.25:
                         self.safe_draw(draw_film_overlay(self.film_progress, self.film_label,
-                                                         width=self.display.w, height=self.display.h),
+                                                         width=self.display.w, height=self.display.h,
+                                                         note=self.film_note),
                                        "film")
                         last_draw = now
                         last_status = film_state
@@ -3984,6 +4345,9 @@ class FilmBoxUI:
                 self.worker.join(timeout=15)
             if self.film_worker and self.film_worker.is_alive():
                 self.film_worker.join(timeout=15)
+            if self.gpu_worker is not None:
+                self.gpu_worker.stop()
+                self.gpu_worker = None
             for dev in self.devices:
                 dev.close()
             if self.display:
@@ -4032,6 +4396,9 @@ def command_demo():
 
 
 def main(argv=None):
+    raw_args = sys.argv[1:] if argv is None else list(argv)
+    if raw_args == ["_gpu-worker"]:
+        return command_gpu_worker()
     refresh_filters()
     parser = argparse.ArgumentParser(description="FilmBox for Cardputer Zero")
     parser.add_argument("command", nargs="?", choices=["ui", "gallery", "photo", "gif", "video", "timelapse", "boomerang", "web", "demo", "diagnose", "config"], default="ui")
