@@ -203,6 +203,8 @@ def load_settings():
         pass
     if defaults["filter"] not in FILTERS:
         defaults["filter"] = "NORMAL"
+    if defaults.get("colour_fix") not in (0, 1, 2, 3):
+        defaults["colour_fix"] = 2
     if isinstance(defaults.get("timelapse_interval"), bool) or not isinstance(
             defaults.get("timelapse_interval"), int) or not (
             0 <= defaults["timelapse_interval"] < len(TIMELAPSE_INTERVALS)):
@@ -1723,6 +1725,83 @@ def _atomic_save_image(image, path, fmt=None, **kwargs):
                 pass
 
 
+def _fix_magenta(image, gain=0.28, step=512):
+    """Pull green up where blue dominates, band by band.
+
+    The IMX219 feed renders clear sky as R≈G<B (magenta-leaning) while a natural
+    sky is R<G<B. Adding a fraction of (B-G) to G in those areas fixes the cast
+    without touching greens, skin or neutrals, where B≈G.
+
+    Works in horizontal bands: an 8 MP copy plus int16 temporaries needs ~85 MB,
+    which is enough to stall this board, while a 512-row band needs ~4 MB.
+    """
+    if np is None or gain <= 0:
+        return image
+    rgb = image if image.mode == "RGB" else image.convert("RGB")
+    arr = np.array(rgb)                      # writable copy, 24 MB at 8 MP
+    h = arr.shape[0]
+    for top in range(0, h, step):
+        blk = arr[top:top + step]
+        b = blk[:, :, 2].astype(np.int16)
+        g = blk[:, :, 1].astype(np.int16)
+        lift = np.clip(b - g, 0, None)
+        if not lift.any():
+            continue
+        lift = (lift * gain).astype(np.int16)
+        blk[:, :, 1] = np.clip(g + lift, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def _apply_colour_fix(path, gain):
+    """Rewrite a captured JPEG with the magenta correction applied."""
+    if gain <= 0:
+        return
+    if available_mb() < 60:
+        with camera_log() as log:
+            log.write(("FilmBox colour fix skipped: only %d MB free\n"
+                       % available_mb()).encode())
+        return
+    try:
+        with Image.open(path) as handle:
+            fixed = _fix_magenta(handle.convert("RGB"), gain)
+        fixed.save(path, quality=95, subsampling=1)
+    except Exception as exc:
+        with camera_log() as log:
+            log.write(("FilmBox colour fix skipped: %s\n" % exc).encode())
+
+
+def _wait_for_exposure(picam, timeout=2.5, tol=0.04):
+    """Block until AE/AWB settle after a mode switch.
+
+    A still capture switches the sensor configuration, which restarts the
+    auto-exposure loop. Grabbing a frame 80 ms later gives a random exposure:
+    backlit scenes came out either 3 stops under or blown out, and the blown
+    ones looked magenta because R and G had clipped while B was still rising.
+    """
+    deadline = time.monotonic() + timeout
+    prev = None
+    stable = 0
+    while time.monotonic() < deadline:
+        try:
+            md = picam.capture_metadata()
+        except Exception:
+            break
+        exp = float(md.get("ExposureTime", 0) or 0)
+        gain = float(md.get("AnalogueGain", 0) or 0)
+        if prev and exp and prev[0]:
+            de = abs(exp - prev[0]) / prev[0]
+            dg = abs(gain - prev[1]) / max(1e-6, prev[1])
+            if de < tol and dg < tol:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+        prev = (exp, gain)
+        time.sleep(0.06)
+    time.sleep(0.05)
+
+
 def filtered_still(original, mode, progress=None, full_res=None):
     """Render the film copy. LUT work is tiled so an 8MP frame stays in RAM."""
     if mode == "NORMAL":
@@ -2106,7 +2185,7 @@ class CameraStream:
             try:
                 # full sensor into the file; zoom & aspect crop applied deterministically below
                 picam.set_controls({"ScalerCrop": (0, 0) + tuple(SENSOR_SIZE)})
-                time.sleep(0.08)
+                _wait_for_exposure(picam)
                 picam.capture_file(str(path))
             finally:
                 try:
@@ -2117,6 +2196,8 @@ class CameraStream:
                 except Exception:
                     self._restore_preview()
         self._crop_file(path, limit)
+        # The colour fix rewrites the whole 8 MP JPEG; running it inside the
+        # capture job stalled the UI, so it moved to the render/background path.
 
     # ---------------------------------------------------------------- video
     def _record_config(self, size):
@@ -3686,11 +3767,25 @@ class FilmBoxUI:
         self.status = value
         self.status_deadline = time.monotonic() + delay
 
+    def _colour_gain(self):
+        gains = (0.0, 0.18, 0.28, 0.36)
+        try:
+            idx = int(self.settings.get("colour_fix", 2) or 0)
+        except Exception:
+            idx = 2
+        return gains[max(0, min(3, idx))]
+
     def film_job(self, original, look):
         """Render the filter copy in its own thread, serialized to protect RAM and camera state."""
         if self.film_busy:
             self.set_status("FILM BUSY - ONE AT A TIME", 4)
             return
+        gain = self._colour_gain()
+        if gain > 0:
+            try:
+                _apply_colour_fix(original, gain)
+            except Exception:
+                pass
         self.film_busy = True
         if not look.startswith(LUT_PREFIX):
             # Built-in filters run at bounded resolution: no need to freeze the viewfinder,
