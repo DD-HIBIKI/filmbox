@@ -24,8 +24,6 @@ import secrets
 import tempfile
 import urllib.parse
 import weakref
-from http import cookies
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import lru_cache
 import array
 import ctypes
@@ -53,9 +51,23 @@ from collections import deque
 
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
-try:
-    from evdev import InputDevice, ecodes, list_devices
-except ImportError:
+# Skip heavy UI/web/NumPy imports in the on-demand `_gpu-worker` subprocess:
+# cuts worker RSS by ~24 MB (59 MB -> ~35 MB) and speeds up cold EGL launch.
+_IS_GPU_WORKER = len(sys.argv) >= 2 and sys.argv[1] == "_gpu-worker"
+
+if not _IS_GPU_WORKER:
+    from http import cookies
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    try:
+        from evdev import InputDevice, ecodes, list_devices
+    except ImportError:
+        InputDevice = None
+        ecodes = None
+        list_devices = None
+else:
+    cookies = None
+    BaseHTTPRequestHandler = object
+    ThreadingHTTPServer = None
     InputDevice = None
     ecodes = None
     list_devices = None
@@ -96,7 +108,8 @@ def _migrate_legacy_paths():
         _atomic_copytree(legacy_photos, ROOT, _link_or_copy)
 
 
-_migrate_legacy_paths()
+if not _IS_GPU_WORKER:
+    _migrate_legacy_paths()
 CONFIG = HOME / ".config" / "filmbox" / "settings.json"
 LOG = HOME / ".local" / "state" / "filmbox" / "camera.log"
 SHUTTER = Path(__file__).resolve().parent / "shutter.wav"
@@ -166,7 +179,8 @@ def refresh_filters():
     return FILTERS
 
 
-refresh_filters()
+if not _IS_GPU_WORKER:
+    refresh_filters()
 EXTRA_MODES = ("TIMELAPSE", "STOPMOTION", "BOOMERANG")
 MODES = ("PHOTO", "GIF", "VIDEO", "TIMELAPSE", "STOPMOTION", "BOOMERANG")
 MODE_BUTTONS = {"PHOTO": "1", "GIF": "2", "VIDEO": "3", "TIMELAPSE": "4"}
@@ -178,17 +192,50 @@ MOVIE_SIZE = (640, 480)
 MAGENTA = (255, 68, 145)
 MINT = (111, 240, 205)
 PAPER = (230, 241, 242)
-# Optional acceleration; package declares python3-numpy on device.
-try:
-    import numpy as np
-except ImportError:
+# Optional acceleration; skipped in `_gpu-worker` to save ~24 MB RSS.
+if _IS_GPU_WORKER:
     np = None
+else:
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
 
+
+_LOG_MAX_BYTES = 512 * 1024
 
 
 def camera_log():
     LOG.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if LOG.exists() and LOG.stat().st_size > _LOG_MAX_BYTES:
+            os.replace(LOG, LOG.with_name(LOG.name + ".1"))
+    except OSError:
+        pass
     return open(LOG, "ab", buffering=0)
+
+
+def log_event(tag, message):
+    """Write a single timestamped diagnostic line to camera.log."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = f"{ts} [{tag}] {message}\n".encode("utf-8", errors="replace")
+    try:
+        with camera_log() as log:
+            log.write(line)
+    except OSError:
+        pass
+
+
+def _proc_rss_mb():
+    """Current process VmRSS in MB (Linux), or None when unavailable."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def timestamp():
@@ -364,14 +411,35 @@ def save_settings(values):
                 pass
 
 
+_SOUND_PROCS = []
+
+
+def _reap_sounds():
+    alive = []
+    for proc in _SOUND_PROCS:
+        try:
+            if proc.poll() is None:
+                alive.append(proc)
+        except Exception:
+            pass
+    _SOUND_PROCS[:] = alive
+
+
 def click(sound=True):
+    _reap_sounds()
     if sound and SHUTTER.exists() and shutil.which("aplay"):
         try:
-            subprocess.Popen(["aplay", "-q", str(SHUTTER)],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            proc = subprocess.Popen(
+                ["aplay", "-q", str(SHUTTER)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            _SOUND_PROCS.append(proc)
         except OSError:
             pass
+
+
+atexit.register(_reap_sounds)
 
 
 def run_command(command, timeout=45):
@@ -426,8 +494,9 @@ GRAY_PALETTE = _palette(GRAY_COLORS)
 _LUT_CACHE = {}
 _LUT_MONO = {}
 _LUT_CACHE_MAX = 2
-CMA_MIN_8MP_MB = 45
-CMA_RELEASE_GPU_MB = 55
+CMA_HARD_MIN_8MP_MB = 26
+CMA_SOFT_8MP_MB = 45
+CMA_RELEASE_GPU_MB = 60
 _HELD_HELPERS = []
 
 
@@ -497,7 +566,7 @@ def _drop_page_cache():
 
 
 def _find_desktop_helpers():
-    """Find same-user `pcmanfm --desktop` PIDs via /proc (Linux only, no subprocess)."""
+    """Find same-user desktop helpers (`pcmanfm --desktop`, `wf-panel-pi`) via /proc."""
     if not sys.platform.startswith("linux") or not hasattr(os, "getuid"):
         return []
     my_uid = os.getuid()
@@ -527,7 +596,7 @@ def _find_desktop_helpers():
         if not parts:
             continue
         exe = os.path.basename(parts[0])
-        if exe == "pcmanfm" and "--desktop" in parts[1:]:
+        if (exe == "pcmanfm" and "--desktop" in parts[1:]) or exe == "wf-panel-pi":
             pids.append(pid)
     return pids
 
@@ -1326,10 +1395,23 @@ class GpuFilm:
 
     @staticmethod
     def _atlas(size, data):
-        if np is None:
-            return data
-        arr = np.frombuffer(data, dtype=np.uint8).reshape(size, size, size, 3)
-        return np.ascontiguousarray(arr.transpose(1, 0, 2, 3).reshape(size, size * size, 3)).tobytes()
+        """Transpose a .cube RGB table (B, G, R, 3) into a 2D GL atlas (G, B*R, 3).
+
+        Pure-Python memoryview runs in ~0.26 ms for 33^3 so `_gpu-worker`
+        never needs to import NumPy (~24 MB RSS saved).
+        """
+        row_len = size * 3
+        plane_len = size * row_len
+        out = bytearray(len(data))
+        mv = memoryview(data)
+        pos = 0
+        for g in range(size):
+            g_off = g * row_len
+            for b in range(size):
+                src_off = b * plane_len + g_off
+                out[pos:pos + row_len] = mv[src_off:src_off + row_len]
+                pos += row_len
+        return bytes(out)
 
     def apply(self, image, cube_path, halation=True, grain=5.0, progress=None,
               colour_fix=COLOUR_FIX_NONE):
@@ -1483,7 +1565,10 @@ def _accel_status():
 
 GRAIN_STRENGTH = 5.0
 GPU_MAX_PIXELS = 8_500_000
-GPU_MIN_FREE_MB = 70
+GPU_MIN_FREE_MB = 30
+GPU_FULL_RES_MIN_MB = 60
+GPU_FULL_RES_MIN_CMA_MB = 10
+CPU_FULL_RES_MIN_MB = 85
 _ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
 _ACCEL_LOCK = threading.Lock()
 _GPU = None
@@ -1655,15 +1740,24 @@ def _render_band(block, top, w, h, cube_path, glow, use_gpu, colour_fix=COLOUR_F
 
 def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=None,
                          colour_fix=COLOUR_FIX_NONE):
-    """Decode JPEG, apply GpuFilm with 2MP memory fallback, and save atomically."""
+    """Decode JPEG, apply GpuFilm (8MP-first, in-place) with 2MP OOM safety net, and save atomically."""
+    t_start = time.monotonic()
     original = Path(original)
     cf = _normalize_colour_fix(colour_fix)
+    avail = available_mb()
     cma = cma_free_mb()
-    room_for_full = available_mb() >= 130 and (cma is None or cma >= 24)
+    # In-place GPU render allocates ~28-35 MB RAM + ~3 MB CMA on top of the
+    # already-resident slim worker (~35 MB), so 60 MB Available / 10 MB CMA is
+    # plenty for full 8MP (old 130 MB wall belonged to multi-buffer CPU paths).
+    room_for_full = avail >= GPU_FULL_RES_MIN_MB and (cma is None or cma >= GPU_FULL_RES_MIN_CMA_MB)
     decode_mb = 24 if (want_full and room_for_full) else 6
-    gpu_budget = available_mb() - decode_mb
-    if gpu_budget < GPU_MIN_FREE_MB or (cma is not None and cma < 12):
-        return None, "low_mem"
+    gpu_budget = avail - decode_mb
+    if gpu_budget < GPU_MIN_FREE_MB or (cma is not None and cma < 8):
+        log_event("GPU", f"skip low_mem mode={mode} avail={avail}MB cma={cma}MB budget={gpu_budget}MB | {mem_snapshot()}")
+        return None, f"low_mem(avail={avail}MB,cma={cma}MB)"
+    if want_full and not room_for_full:
+        log_event("GPU", f"2mp_guard mode={mode} avail={avail}MB<{GPU_FULL_RES_MIN_MB}MB or cma={cma}MB<{GPU_FULL_RES_MIN_CMA_MB}MB | {mem_snapshot()}")
+    t_dec0 = time.monotonic()
     with Image.open(original) as handle:
         if not (want_full and room_for_full):
             try:
@@ -1677,30 +1771,45 @@ def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=Non
         image = image.resize((max(1, int(image.width * scale)),
                               max(1, int(image.height * scale))),
                              Image.Resampling.BOX)
+    t_dec = time.monotonic() - t_dec0
     if image.width * image.height > GPU_MAX_PIXELS:
         return None, "too_large"
+    t_gpu0 = time.monotonic()
+    oom_fallback = False
     try:
         result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH,
                            progress=progress, colour_fix=cf)
     except (MemoryError, OSError) as exc:
-        with camera_log() as log:
-            log.write(("FilmBox GPU memory fallback: %s | %s\n"
-                       % (exc, mem_snapshot())).encode())
+        oom_fallback = True
+        log_event("GPU", f"8mp_oom_fallback err={exc} -> retrying 2MP | {mem_snapshot()}")
         scale = min(LUT_SAVE_MAX[0] / image.width, LUT_SAVE_MAX[1] / image.height)
         small = image.resize((max(1, int(image.width * scale)),
                               max(1, int(image.height * scale))),
                              Image.Resampling.BOX)
         del image
+        reclaim_memory()
         image = small
         result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH,
                            progress=progress, colour_fix=cf)
-    tag = "" if max(result.size) > max(LUT_SAVE_MAX) else "_%dmp" % round(
-        result.width * result.height / 1e6)
+    t_gpu = time.monotonic() - t_gpu0
+    rw, rh = result.size
+    tag = "" if max(rw, rh) > max(LUT_SAVE_MAX) else "_%dmp" % round(rw * rh / 1e6)
     out_path = original.with_name(original.stem + "_" +
                                   mode.replace(":", "-").lower() + tag + ".jpg")
+    t_sav0 = time.monotonic()
     _atomic_save_image(result, out_path, "JPEG", quality=93, subsampling=1)
+    t_sav = time.monotonic() - t_sav0
+    size_kb = out_path.stat().st_size // 1024 if out_path.exists() else 0
     del image, result
     reclaim_memory()
+    t_tot = time.monotonic() - t_start
+    rss = _proc_rss_mb()
+    log_event(
+        "GPU",
+        f"render ok {out_path.name} {rw}x{rh} {size_kb}KB "
+        f"(total={t_tot:.2f}s dec={t_dec:.2f}s gpu={t_gpu:.2f}s save={t_sav:.2f}s"
+        f"{' oom_2mp' if oom_fallback else ''} rss={rss}MB) | {mem_snapshot()}"
+    )
     return out_path, None
 
 
@@ -1749,12 +1858,20 @@ def command_gpu_worker():
     except ValueError:
         idle_sec = GPU_WORKER_IDLE_SEC
 
+    t_init0 = time.monotonic()
     try:
         gpu = GpuFilm()
     except Exception as exc:
         emit({"event": "fail", "error": str(exc)})
         return 1
-    emit({"event": "ready", "renderer": gpu.renderer, "maxt": gpu.maxt})
+    emit({
+        "event": "ready",
+        "renderer": gpu.renderer,
+        "maxt": gpu.maxt,
+        "pid": os.getpid(),
+        "rss_mb": _proc_rss_mb(),
+        "init_s": round(time.monotonic() - t_init0, 2),
+    })
 
     req_q = queue.Queue()
 
@@ -1821,6 +1938,8 @@ class GpuWorker:
         self.renderer = ""
         self.maxt = 0
         self.error = None
+        self._crash_count = 0
+        self._spawn_t0 = 0.0
         self._cond = threading.Condition()
         self._job_lock = threading.Lock()
         self._progress_cb = None
@@ -1828,10 +1947,11 @@ class GpuWorker:
 
     def start(self):
         with self._cond:
-            if self.state in ("warming", "ready", "stopped"):
+            if self.state in ("warming", "ready", "stopped", "failed"):
                 return
             self.state = "warming"
             self.error = None
+            self._spawn_t0 = time.monotonic()
         log_fh = None
         try:
             log_fh = camera_log()
@@ -1843,11 +1963,13 @@ class GpuWorker:
                 text=True,
                 bufsize=1,
             )
+            log_event("GPU", f"worker spawned pid={self.proc.pid} | {mem_snapshot()}")
         except Exception as exc:
             with self._cond:
                 self.state = "failed"
                 self.error = str(exc)
                 self._cond.notify_all()
+            log_event("GPU", f"worker spawn failed: {exc}")
             return
         finally:
             if log_fh is not None:
@@ -1873,6 +1995,7 @@ class GpuWorker:
     def _read_loop(self):
         proc = self.proc
         idle_exited = False
+        explicit_fail = False
         try:
             assert proc is not None and proc.stdout is not None
             for line in proc.stdout:
@@ -1897,36 +2020,38 @@ class GpuWorker:
                         self.state = "ready"
                         self.renderer = str(msg.get("renderer", ""))
                         self.maxt = int(msg.get("maxt", 0))
-                        with camera_log() as log:
-                            log.write(("FilmBox accel: GPU worker ready (%s, max tex %d)\n"
-                                       % (self.renderer, self.maxt)).encode())
+                        dt = time.monotonic() - self._spawn_t0 if self._spawn_t0 else 0.0
+                        log_event(
+                            "GPU",
+                            f"worker ready pid={msg.get('pid', getattr(proc, 'pid', 0))} "
+                            f"renderer='{self.renderer}' maxt={self.maxt} "
+                            f"rss={msg.get('rss_mb')}MB spawn={dt:.2f}s | {mem_snapshot()}"
+                        )
                     elif ev == "idle_exit":
                         idle_exited = True
                         if self.state != "stopped":
                             self.state = "idle"
-                        with camera_log() as log:
-                            log.write(b"FilmBox accel: GPU worker idle-exited (RAM/CMA freed)\n")
+                        log_event("GPU", f"worker idle-exited after {GPU_WORKER_IDLE_SEC:.0f}s | {mem_snapshot()}")
                     elif ev == "fail":
+                        explicit_fail = True
                         self.state = "failed"
                         self.error = str(msg.get("error", "init failed"))
-                        with camera_log() as log:
-                            log.write(("FilmBox accel: GPU worker unavailable (%s)\n"
-                                       % self.error).encode())
+                        log_event("GPU", f"worker unavailable ({self.error}) | {mem_snapshot()}")
                     elif ev in ("done", "error", "fallback"):
                         self._job_result = msg
                     self._cond.notify_all()
         except Exception as exc:
             with self._cond:
                 if self.state not in ("stopped", "idle"):
-                    self.state = "failed"
                     self.error = str(exc)
                 if self._job_result is None:
                     self._job_result = {"event": "error", "error": str(exc)}
                 self._cond.notify_all()
         finally:
+            rc = None
             if proc is not None:
                 try:
-                    proc.wait(timeout=1.5)
+                    rc = proc.wait(timeout=1.5)
                 except Exception:
                     pass
                 for stream in (proc.stdin, proc.stdout):
@@ -1942,15 +2067,25 @@ class GpuWorker:
                     self.state = "idle"
                     if self._job_result is None:
                         self._job_result = {"event": "idle_exit"}
-                elif self.state not in ("stopped", "failed", "idle"):
+                elif explicit_fail:
                     self.state = "failed"
-                    self.error = self.error or "GPU worker exited"
+                elif self.state not in ("stopped", "failed", "idle"):
+                    # Transient crash / OOM-kill: allow up to 2 automatic respawns
+                    # instead of permanently poisoning GPU for the whole session.
+                    self._crash_count += 1
+                    self.error = self.error or f"GPU worker exited (rc={rc})"
+                    if self._crash_count >= 3:
+                        self.state = "failed"
+                        log_event("GPU", f"worker died rc={rc} crashes={self._crash_count} -> disabled | {mem_snapshot()}")
+                    else:
+                        self.state = "idle"
+                        log_event("GPU", f"worker died rc={rc} crashes={self._crash_count} -> will respawn | {mem_snapshot()}")
                 if self._job_result is None:
-                    self._job_result = {"event": "error", "error": "GPU worker exited"}
+                    self._job_result = {"event": "error", "error": self.error or f"GPU worker exited (rc={rc})"}
                 self._cond.notify_all()
 
     def render(self, original, mode, cube_path, full_res=True, progress=None,
-               on_status=None, wait_timeout=10.0, render_timeout=60.0,
+               on_status=None, wait_timeout=12.0, render_timeout=60.0,
                colour_fix=COLOUR_FIX_NONE):
         """Render a LUT copy in the on-demand GPU worker.
 
@@ -1979,14 +2114,14 @@ class GpuWorker:
                                 break
                             self._cond.wait(timeout=rem)
                         if self.state == "warming":
-                            with camera_log() as log:
-                                log.write(b"FilmBox accel: GPU worker warm-up timed out; falling back to CPU\n")
+                            log_event("GPU", f"warm-up timed out after {wait_timeout:.0f}s -> CPU fallback | {mem_snapshot()}")
                             if on_status is not None:
                                 on_status("GPU BUSY -> CPU RENDER")
                             return None
                     if self.state != "ready" or self.proc is None or self.proc.stdin is None:
                         if attempt == 0 and self.state == "idle":
                             continue
+                        log_event("GPU", f"render skipped state={self.state} err={self.error} -> CPU fallback | {mem_snapshot()}")
                         if on_status is not None and self.state == "failed":
                             on_status("GPU UNAVAILABLE -> CPU")
                         return None
@@ -2010,9 +2145,12 @@ class GpuWorker:
                         self._progress_cb = None
                         if attempt == 0 and self.state == "idle":
                             continue
-                        if self.state != "idle":
-                            self.state = "failed"
+                        if self.state not in ("stopped", "failed"):
+                            self.state = "idle"
                         self.error = str(exc)
+                    log_event("GPU", f"pipe write failed ({exc}) attempt={attempt + 1} | {mem_snapshot()}")
+                    if attempt == 0:
+                        continue
                     if on_status is not None:
                         on_status("GPU LOST -> CPU RENDER")
                     return None
@@ -2028,30 +2166,31 @@ class GpuWorker:
                 if result and result.get("event") == "idle_exit" and attempt == 0:
                     continue
                 if not result:
-                    with camera_log() as log:
-                        log.write(b"FilmBox accel: GPU worker render timed out\n")
-                    self.stop()
+                    log_event("GPU", f"render timed out after {render_timeout:.0f}s -> CPU fallback | {mem_snapshot()}")
+                    self._shutdown(next_state="idle")
                     if on_status is not None:
                         on_status("GPU TIMEOUT -> CPU")
                     return None
                 if result.get("event") == "done":
+                    self._crash_count = 0
                     return Path(result["path"])
-                with camera_log() as log:
-                    log.write(("FilmBox accel: GPU worker fallback (%s)\n"
-                               % (result.get("error") or result.get("reason") or "unknown")).encode())
+                reason = result.get("error") or result.get("reason") or "unknown"
+                log_event("GPU", f"worker fallback ({reason}) | {mem_snapshot()}")
                 if on_status is not None:
                     on_status("CPU FALLBACK")
                 return None
             return None
 
-    def release(self):
-        """Shut down an idle worker to immediately free ~59 MB RSS + CMA, keeping it reusable."""
+    def release(self, reason="cma_precheck"):
+        """Shut down an idle worker to immediately free RSS + CMA, keeping it reusable."""
         if not self.is_running():
             return
         if not self._job_lock.acquire(blocking=False):
             return
         try:
+            log_event("GPU", f"releasing idle worker reason={reason} | {mem_snapshot()}")
             self._shutdown(next_state="idle")
+            log_event("GPU", f"worker released | {mem_snapshot()}")
         finally:
             self._job_lock.release()
 
@@ -2116,55 +2255,38 @@ def _atomic_save_image(image, path, fmt=None, **kwargs):
 
 @lru_cache(maxsize=16)
 def _channel_mul_lut(mul):
-    if np is None:
-        return [min(255, int(v * mul + 0.5)) for v in range(256)]
-    vals = np.rint(np.arange(256, dtype=np.float32) * float(mul))
-    return np.clip(vals, 0, 255).astype(np.uint8)
+    return [min(255, int(round(v * float(mul)))) for v in range(256)]
+
+
+@lru_cache(maxsize=16)
+def _sky_lift_lut(k):
+    return [min(255, (d * k + 128) >> 8) for d in range(256)]
 
 
 def _fix_magenta_band(band, spec=COLOUR_FIX_PRESETS[2]):
-    """Apply IMX219 WB channel LUTs + uint16 blue-sky green lift (~2.5 MB/band).
+    """Apply optional WB channel LUTs + sky-only B>G green lift in pure Pillow C.
 
-    Accepts either a 4-tuple (r_mul, g_mul, b_mul, sky_lift) or a legacy scalar
-    sky_lift float. Uses 256-byte LUT lookups for channel scaling and masked
-    uint16 fixed-point arithmetic for sky lift (zero float64 arrays).
+    Zero NumPy dependency (so `_gpu-worker` skips importing NumPy) and ~2x faster
+    than NumPy masked indexing while staying bit-for-bit identical to
+    `((diff * k + 128) >> 8)`. Non-blue bands short-circuit via `diff.getbbox()`.
     """
     r_mul, g_mul, b_mul, sky_k = _normalize_colour_fix(spec)
-    has_r = abs(r_mul - 1.0) > 1e-4
-    has_g = abs(g_mul - 1.0) > 1e-4
-    has_b = abs(b_mul - 1.0) > 1e-4
-    has_wb = has_r or has_g or has_b
+    has_wb = abs(r_mul - 1.0) > 1e-4 or abs(g_mul - 1.0) > 1e-4 or abs(b_mul - 1.0) > 1e-4
     k = int(round(sky_k * 256))
     if not has_wb and k <= 0:
         return band
     rgb = band if band.mode == "RGB" else band.convert("RGB")
-    if np is None:
-        if has_wb:
-            lut = _channel_mul_lut(r_mul) + _channel_mul_lut(g_mul) + _channel_mul_lut(b_mul)
-            return rgb.point(lut)
-        return rgb
-    arr = np.array(rgb, dtype=np.uint8)
-    changed = False
-    if has_r:
-        arr[:, :, 0] = _channel_mul_lut(r_mul)[arr[:, :, 0]]
-        changed = True
-    if has_g:
-        arr[:, :, 1] = _channel_mul_lut(g_mul)[arr[:, :, 1]]
-        changed = True
-    if has_b:
-        arr[:, :, 2] = _channel_mul_lut(b_mul)[arr[:, :, 2]]
-        changed = True
+    if has_wb:
+        lut = _channel_mul_lut(r_mul) + _channel_mul_lut(g_mul) + _channel_mul_lut(b_mul)
+        rgb = rgb.point(lut)
     if k > 0:
-        g = arr[:, :, 1]
-        b = arr[:, :, 2]
-        mask = b > g
-        if mask.any():
-            diff = b[mask].astype(np.uint16) - g[mask].astype(np.uint16)
-            g[mask] = np.minimum(
-                255, g[mask].astype(np.uint16) + ((diff * k + 128) >> 8)
-            ).astype(np.uint8)
-            changed = True
-    return Image.fromarray(arr, "RGB") if changed else rgb
+        r, g, b = rgb.split()
+        diff = ImageChops.subtract(b, g)
+        if diff.getbbox() is None:
+            return rgb
+        g = ImageChops.add(g, diff.point(_sky_lift_lut(k)))
+        return Image.merge("RGB", (r, g, b))
+    return rgb
 
 
 def _fix_magenta(image, spec=COLOUR_FIX_PRESETS[2], step=256):
@@ -2193,21 +2315,22 @@ def _apply_colour_fix(path, spec):
     cf = _normalize_colour_fix(spec)
     if not _colour_fix_active(cf):
         return
-    if available_mb() < 60:
-        with camera_log() as log:
-            log.write(("FilmBox colour fix skipped: only %d MB free\n"
-                       % available_mb()).encode())
+    avail = available_mb()
+    if avail < 50:
+        log_event("COLOUR", f"skipped {Path(path).name}: avail={avail}MB<50MB | {mem_snapshot()}")
         return
+    t0 = time.monotonic()
     try:
         with Image.open(path) as handle:
             rgb = handle.convert("RGB")
+        w, h = rgb.size
         _fix_magenta(rgb, cf)
         _atomic_save_image(rgb, path, "JPEG", quality=93, subsampling=1)
         del rgb
         reclaim_memory()
+        log_event("COLOUR", f"ok {Path(path).name} {w}x{h} ({time.monotonic() - t0:.2f}s) | {mem_snapshot()}")
     except Exception as exc:
-        with camera_log() as log:
-            log.write(("FilmBox colour fix skipped: %s\n" % exc).encode())
+        log_event("COLOUR", f"failed {Path(path).name}: {exc} | {mem_snapshot()}")
 
 
 def _wait_for_exposure(picam, timeout=1.5, tol=0.05):
@@ -2250,9 +2373,12 @@ def filtered_still(original, mode, progress=None, full_res=None,
     cube_file = resolve_lut_path(mode[len(LUT_PREFIX):]) if is_lut else None
     # Measure free RAM *before* decoding: an 8MP RGB copy eats ~24 MB (2MP eats ~6 MB).
     want_full = LUT_FULL_RES if full_res is None else bool(full_res)
-    room_for_full = available_mb() >= 130
+    avail = available_mb()
+    room_for_full = avail >= CPU_FULL_RES_MIN_MB
     decode_mb = 24 if (want_full and room_for_full) else 6
-    gpu_budget = available_mb() - decode_mb
+    gpu_budget = avail - decode_mb
+    if is_lut and want_full and not room_for_full:
+        log_event("CPU", f"2mp_guard {Path(original).name} avail={avail}MB<{CPU_FULL_RES_MIN_MB}MB | {mem_snapshot()}")
     if (is_lut and want_full and room_for_full
             and os.environ.get("FILMBOX_STREAM", "0") == "1"):
         try:
@@ -2647,34 +2773,51 @@ class CameraStream:
 
     def capture_still(self, path, resolution=None):
         limit = resolution or SENSOR_SIZE
-        # Pre-check CmaFree before trying full 8MP: avoids triggering a kernel
-        # ENOMEM inside unicam/vc4 that can stall recovery on 128 MB CMA boards.
         want_8mp = limit[0] * limit[1] > 2_500_000
         cma = cma_free_mb() if want_8mp else None
-        low_cma = cma is not None and cma < CMA_MIN_8MP_MB
-        if low_cma:
-            with camera_log() as log:
-                log.write(("FilmBox capture precheck: CmaFree=%dMB < %dMB -> 2MP | %s\n"
-                           % (cma, CMA_MIN_8MP_MB, mem_snapshot())).encode())
+        # Only skip attempting 8MP upfront if CMA is critically below physical minimum
+        # (< 26 MB); between 26-45 MB, reclaim and try 8MP first (picam.stop() frees
+        # preview CMA right before still allocation).
+        if want_8mp and cma is not None and cma < CMA_SOFT_8MP_MB:
+            _drop_page_cache()
+            reclaim_memory()
+            cma = cma_free_mb()
+        hard_low_cma = cma is not None and cma < CMA_HARD_MIN_8MP_MB
+        if hard_low_cma:
+            log_event("CAPTURE", f"hard_low_cma CmaFree={cma}MB<{CMA_HARD_MIN_8MP_MB}MB -> 2MP | {mem_snapshot()}")
         # Bursts of 8 MP shots can outrun the CMA pool: a capture then fails with
-        # ENOMEM. Back off first, then step the sensor mode down to 2x2 binned 2MP.
+        # ENOMEM. Reclaim and retry 8MP once, then fall back to 2x2 binned 2MP only
+        # as a last resort so capture never crashes.
         last = None
         for attempt in range(4):
-            use_2mp = low_cma or attempt >= 2
+            use_2mp = hard_low_cma or attempt >= 2
             sensor_mode = (1640, 1232) if use_2mp else SENSOR_SIZE
             eff_limit = (min(limit[0], 1640), min(limit[1], 1232)) if use_2mp else limit
+            t0 = time.monotonic()
             try:
-                return self._capture_once(path, eff_limit, sensor_mode)
+                ae_s = self._capture_once(path, eff_limit, sensor_mode)
+                try:
+                    with Image.open(path) as probe:
+                        pw, ph = probe.size
+                    kb = Path(path).stat().st_size // 1024
+                except Exception:
+                    pw, ph, kb = eff_limit[0], eff_limit[1], 0
+                log_event(
+                    "CAPTURE",
+                    f"ok {Path(path).name} {pw}x{ph} {kb}KB sensor={sensor_mode[0]}x{sensor_mode[1]} "
+                    f"try={attempt + 1} ({time.monotonic() - t0:.2f}s ae={ae_s:.2f}s) | {mem_snapshot()}"
+                )
+                return
             except OSError as exc:
                 last = exc
                 if getattr(exc, "errno", None) != 12:
+                    log_event("CAPTURE", f"error try={attempt + 1} ({sensor_mode}): {exc} | {mem_snapshot()}")
                     raise
-                with camera_log() as log:
-                    log.write(("FilmBox capture ENOMEM try %d (%s) | %s\n"
-                               % (attempt + 1, sensor_mode, mem_snapshot())).encode())
+                log_event("CAPTURE", f"ENOMEM try={attempt + 1} sensor={sensor_mode[0]}x{sensor_mode[1]} | {mem_snapshot()}")
                 self._restore_preview()
+                _drop_page_cache()
                 reclaim_memory()
-                time.sleep(0.4 + 0.3 * attempt)
+                time.sleep(0.5 + 0.3 * attempt)
         raise last
 
     def _capture_once(self, path, limit, sensor_size=SENSOR_SIZE):
@@ -2683,6 +2826,7 @@ class CameraStream:
         scale = min(1.0, max(limit[0] / float(sw), limit[1] / float(sh)) * zoom)
         size = (max(2, min(sensor_size[0], int(round(sw * scale))) // 2 * 2),
                 max(2, min(sensor_size[1], int(round(sh * scale))) // 2 * 2))
+        ae_s = 0.0
         with self.camlock:
             picam = self.picam
             if picam is None:
@@ -2694,7 +2838,9 @@ class CameraStream:
             try:
                 # full sensor into the file; zoom & aspect crop applied deterministically below
                 picam.set_controls({"ScalerCrop": (0, 0) + tuple(SENSOR_SIZE)})
+                t_ae = time.monotonic()
                 _wait_for_exposure(picam)
+                ae_s = time.monotonic() - t_ae
                 picam.capture_file(str(path))
             finally:
                 try:
@@ -2705,6 +2851,7 @@ class CameraStream:
                 except Exception:
                     self._restore_preview()
         self._crop_file(path, limit)
+        return ae_s
         # The colour fix rewrites the whole 8 MP JPEG; running it inside the
         # capture job stalled the UI, so it moved to the render/background path.
 
@@ -4322,9 +4469,9 @@ class FilmBoxUI:
             return
         was_live = bool(getattr(self.stream, "running", False))
         want = RESOLUTION_LABELS[self.settings.get("resolution", 0)]
-        # The viewfinder is about to be frozen, which frees ~16 MB, so a frame
-        # that looks tight right now may still make full resolution.
-        tight = available_mb() < 130 and self.settings.get("resolution", 0) == 0
+        # With slim no-numpy GPU worker (~35 MB) and in-place rendering, 8MP only
+        # becomes tight if total MemAvailable is below ~95 MB even before stream.stop().
+        tight = available_mb() < 95 and self.settings.get("resolution", 0) == 0
         label = (LookPicker.label(look) + "  " + want +
                  ("  (LOW MEM -> 2MP)" if tight else ""))
         self.film_progress = 0
@@ -4343,17 +4490,22 @@ class FilmBoxUI:
             self.film_note = text
 
         def render():
+            t_film0 = time.monotonic()
+            engine = "cpu"
             try:
+                full_res = self.settings.get("lut_full_res", True)
+                log_event("FILM", f"start src={original.name} look={look} want_full={full_res} | {mem_snapshot()}")
                 if was_live:
                     # Freezing the viewfinder gives the render ~14 % more CPU and
                     # ~16 MB RAM + camera CMA before lazily starting _gpu-worker.
+                    t_st = time.monotonic()
                     try:
                         self.stream.stop()
-                    except Exception:
-                        pass
+                        log_event("STREAM", f"stop for film ({time.monotonic() - t_st:.2f}s) | {mem_snapshot()}")
+                    except Exception as exc:
+                        log_event("STREAM", f"stop for film err: {exc}")
                 _trim_lut_cache(keep_look=look)
                 reclaim_memory()
-                full_res = self.settings.get("lut_full_res", True)
                 output_path = None
                 if (self.gpu_worker is not None
                         and os.environ.get("FILMBOX_STREAM", "0") != "1"):
@@ -4366,49 +4518,72 @@ class FilmBoxUI:
                         colour_fix=cf,
                     )
                     if output_path is not None:
+                        engine = "gpu"
                         on_progress(100)
                 if output_path is None:
+                    engine = "cpu"
+                    log_event("FILM", f"cpu_render start look={look} want_full={full_res} | {mem_snapshot()}")
                     output_path = filtered_still(original, look, progress=on_progress,
                                                  full_res=full_res, colour_fix=cf)
                 output_name = output_path.name if output_path is not None else ""
+                pw = ph = 0
                 try:
                     with Image.open(original.with_name(output_name)) as probe:
-                        pixels = probe.width * probe.height
+                        pw, ph = probe.size
+                    pixels = pw * ph
                 except Exception:
                     pixels = 0
                 size_tag = ("%dMP" % round(pixels / 1e6)) if pixels else "FILM"
+                log_event(
+                    "FILM",
+                    f"done engine={engine} out={output_name} {pw}x{ph} "
+                    f"total={time.monotonic() - t_film0:.2f}s | {mem_snapshot()}"
+                )
                 self.set_status("SAVED +FILM " + size_tag, 5)
             except Exception as exc:
-                with camera_log() as log:
-                    log.write(f"FilmBox film error: {type(exc).__name__}: {exc}\n".encode())
+                log_event("ERR", f"film_job failed: {type(exc).__name__}: {exc} | {mem_snapshot()}")
                 self.set_status("FILM ERR " + str(exc)[:26], 10)
             finally:
                 self.film_progress = None
                 self.film_note = ""
                 self.film_busy = False
                 if was_live and self.running and self.gallery is None and self.timelapse is None:
+                    t_rs = time.monotonic()
                     try:
                         self.stream.start()
-                    except Exception:
-                        pass
+                        log_event("STREAM", f"restart after film ({time.monotonic() - t_rs:.2f}s) | {mem_snapshot()}")
+                    except Exception as exc:
+                        log_event("STREAM", f"restart after film failed: {exc}")
         self.film_worker = threading.Thread(target=render, daemon=True)
         self.film_worker.start()
 
     def do_photo(self):
         def operation():
-            # Free unused LUT caches and, if CMA is tight, release any idle
-            # _gpu-worker (~59 MB RSS + CMA) BEFORE attempting an 8MP capture.
+            # Free unused LUT caches and, if CMA is below 60 MB, release any idle
+            # _gpu-worker BEFORE attempting an 8MP capture. Keep 8MP as the primary
+            # target and only downgrade upfront when CMA < CMA_HARD_MIN_8MP_MB (26 MB).
             _trim_lut_cache(keep_look=self.settings["filter"])
             target_res = RESOLUTIONS[self.settings["resolution"]]
+            look = self.settings["filter"]
+            log_event(
+                "PHOTO",
+                f"start target={target_res[0]}x{target_res[1]} look={look} "
+                f"zoom={self.settings.get('zoom', 1.0):g}x | {mem_snapshot()}"
+            )
             if target_res[0] * target_res[1] > 2_500_000:
                 if (self.gpu_worker is not None and self.gpu_worker.is_running()
                         and not self.film_busy):
                     cma_now = cma_free_mb()
                     if cma_now is not None and cma_now < CMA_RELEASE_GPU_MB:
-                        self.gpu_worker.release()
+                        self.gpu_worker.release(reason=f"cma={cma_now}MB<{CMA_RELEASE_GPU_MB}MB")
                 reclaim_memory()
                 cma_now = cma_free_mb()
-                if cma_now is not None and cma_now < CMA_MIN_8MP_MB:
+                if cma_now is not None and cma_now < CMA_SOFT_8MP_MB:
+                    _drop_page_cache()
+                    reclaim_memory()
+                    cma_now = cma_free_mb()
+                if cma_now is not None and cma_now < CMA_HARD_MIN_8MP_MB:
+                    log_event("PHOTO", f"hard_low_cma {cma_now}MB<{CMA_HARD_MIN_8MP_MB}MB -> 2MP | {mem_snapshot()}")
                     self.set_status("LOW MEM - USING 2MP", 4)
                     target_res = (1640, 1232)
             else:
@@ -4418,7 +4593,6 @@ class FilmBoxUI:
             click(self.settings["sound"])
             self.stream.capture_still(original, target_res)
             self.set_status("SAVED " + original.name[:24], 3)
-            look = self.settings["filter"]
             if look != "NORMAL":
                 self.film_job(original, look)
             else:
@@ -4817,15 +4991,48 @@ class FilmBoxUI:
                     width=self.display.w, height=self.display.h, fps=0,
                     clean=self.settings.get("clean_ui", False),
                     zoom=self.settings.get("zoom", 1.0)), "boot")
-                _drop_page_cache()
+                dropped = _drop_page_cache()
                 held_helpers = _suspend_helpers()
                 reclaim_memory()
-                with camera_log() as log:
-                    log.write(("FilmBox startup mem: %s (held_helpers=%d)\n"
-                               % (mem_snapshot(), len(held_helpers))).encode())
+                # Right after a cold boot, system services may still be releasing
+                # transient CMA; give it up to 1.5s to settle if CmaFree < 45 MB.
+                cma_boot = cma_free_mb()
+                settle_s = 0.0
+                if cma_boot is not None and cma_boot < CMA_SOFT_8MP_MB:
+                    self.safe_draw(draw_ui(
+                        None, self.mode, self.settings["filter"],
+                        RESOLUTION_LABELS[self.settings["resolution"]],
+                        "FREEING MEM...", self.settings["sound"], 0,
+                        width=self.display.w, height=self.display.h, fps=0,
+                        clean=self.settings.get("clean_ui", False),
+                        zoom=self.settings.get("zoom", 1.0)), "boot")
+                    t_settle0 = time.monotonic()
+                    while time.monotonic() - t_settle0 < 1.5:
+                        time.sleep(0.3)
+                        _drop_page_cache()
+                        reclaim_memory()
+                        cma_boot = cma_free_mb()
+                        if cma_boot is None or cma_boot >= CMA_SOFT_8MP_MB:
+                            break
+                    settle_s = time.monotonic() - t_settle0
+                tuning_p = resolve_tuning_file()
+                log_event(
+                    "BOOT",
+                    f"FilmBox {VERSION} pid={os.getpid()} rss={_proc_rss_mb()}MB "
+                    f"accel={_ACCEL} filter={self.settings['filter']} "
+                    f"cf={self.settings.get('colour_fix', 2)} "
+                    f"tuning={tuning_p.name if tuning_p else 'system'} "
+                    f"drop_cache={dropped} held={held_helpers} settle={settle_s:.2f}s | {mem_snapshot()}"
+                )
                 if _ACCEL in ("auto", "gpu"):
                     self.gpu_worker = GpuWorker()
+                t_cam0 = time.monotonic()
                 self.stream.start()
+                log_event(
+                    "STREAM",
+                    f"start ok {self.stream.size[0]}x{self.stream.size[1]}@{self.stream.fps}fps "
+                    f"({time.monotonic() - t_cam0:.2f}s) | {mem_snapshot()}"
+                )
             last_draw = 0.0
             last_status = None
             while self.running:
@@ -5004,6 +5211,8 @@ class FilmBoxUI:
                 self.gpu_worker.stop()
                 self.gpu_worker = None
             _resume_helpers(held_helpers)
+            _reap_sounds()
+            log_event("EXIT", f"FilmBox shutdown resumed={held_helpers} | {mem_snapshot()}")
             for dev in self.devices:
                 dev.close()
             if self.display:

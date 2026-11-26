@@ -27,7 +27,7 @@ Cardputer Zero（CM0 / RP3A0）上的 Mesa `vc4` 驱动限制极严，改 `GpuFi
    - 曾把 `GL_RGB` 写成 `0x1908`，导致传入 3 字节 RGB buffer 时驱动按 4 字节读取，越界多读 33% 堆内存直接触发 `vc4` **SIGSEGV** 且颜色错位。所有 3 字节 RGB 上传前必须设 `glPixelStorei(0x0CF5, 1)`（`GL_UNPACK_ALIGNMENT = 1`）。
 2. **EGL 上下文只能在进程主线程创建（`GpuFilm()`），UI 侧通过独立子进程 `_gpu-worker` 按需懒启动并空闲退出**
    - 在 `vc4` 驱动上，从 `threading.Thread` 子线程首次调用 `eglCreateContext` 会在 C 层直接崩溃（Python `try...except` 拦不住）。
-   - UI 模式使用独立子进程（`GpuWorker` → `filmbox.py _gpu-worker`）：子进程在**自身进程主线程**初始化 `GpuFilm()`，**严禁在 App 启动时常驻拉起**（实测 `_gpu-worker` 常驻会额外占用 ~59 MB RSS + CMA，导致冷启动首张 8MP 触发 `ENOMEM`）。必须在首次渲染 LUT 且 `self.stream.stop()` 之后才懒启动，并在空闲 30 秒后自动退出（`GPU_WORKER_IDLE_SEC = 30.0`），同时绑定 `PR_SET_PDEATHSIG(SIGTERM)` 防止父进程异常退出留孤儿进程。
+   - UI 模式使用独立子进程（`GpuWorker` → `filmbox.py _gpu-worker`）：子进程在**自身进程主线程**初始化 `GpuFilm()`，入口通过 `_IS_GPU_WORKER` 跳过 `numpy`/`evdev`/`http.server` 导入（将 worker RSS 从 ~59 MB 压到 ~35 MB），**严禁在 App 启动时常驻拉起**。必须在首次渲染 LUT 且 `self.stream.stop()` 之后才懒启动，并在空闲 30 秒后自动退出（`GPU_WORKER_IDLE_SEC = 30.0`），同时绑定 `PR_SET_PDEATHSIG(SIGTERM)` 防止父进程异常退出留孤儿进程。原地 GPU 渲染仅需 ~30 MB 增量内存，8MP GPU 阈值保持 `GPU_FULL_RES_MIN_MB = 60` / `GPU_MIN_FREE_MB = 30`（切勿沿用旧 CPU 的 130 MB 门槛导致误降级 2MP 或回退慢速 CPU）。
    - 进程内路径（CLI `photo`、`tools/bench_accel.py`）初始化后立即 `eglMakeCurrent(dpy, 0, 0, 0)` 释放绑定，渲染时在 `_ACCEL_LOCK` 内成对执行 `_make_current()` 与 `finally: _release_current()`；`_gpu_ready()` 中当 `_GPU_STATE == 0` 且不是 `threading.main_thread()` 时，**必须直接返回 `False` 回退 CPU**，绝不在子线程懒加载 `GpuFilm()`。
 3. **禁止读写同一纹理（GLES2 Feedback Loop）**
    - 绝不能把同一张纹理同时绑在 `GL_TEXTURE0`（片元着色器采样输入）和 `self.fb` 的 `GL_COLOR_ATTACHMENT0`（渲染输出）上。必须保持 `self.src_tex`（`GL_RGB`）与 `self.dst_tex`（`GL_RGBA`）分离。
@@ -55,7 +55,7 @@ Cardputer Zero（CM0 / RP3A0）上的 Mesa `vc4` 驱动限制极严，改 `GpuFi
    - **长文件禁全量读内存**：统计 `.mjpeg` 帧数必须按 64 KB 分块扫描（`_count_mjpeg_frames`），严禁 `raw.read_bytes()`（录 2 分钟视频就超过 150 MB 必触发 OOM）。
    - **渲染期锁操作**：8MP 胶片渲染会停预览流（`self.stream.stop()`），期间 `self.film_progress is not None` 时必须在 `key()` 拦截快门、进相册和退出键；`render()` 结束的 `finally` 只有在 `self.running and self.gallery is None and self.timelapse is None` 时才能重启预览流。
    - **成片原子落盘**：所有后台生成的 JPG/PNG 必须走 `_atomic_save_image`（先写隐藏 `.tmp` 再 `os.replace`），防止中断留下半截坏图或被 Wi-Fi 相册读到残片。
-   - **冷启动先亮屏且绝不常驻预热 GPU**：`run()` 里必须先打开 `Framebuffer` 画一帧 `"STARTING CAMERA"`（<50 ms 响应），随后执行可选页缓存清理（仅 `1`、非 root 静默跳过）与同用户 `pcmanfm --desktop` 挂起（`finally` 与 `atexit` 保证 `SIGCONT`），再 `self.stream.start()` 进入实时取景。`GpuWorker()` 仅创建轻量控制器，绝不在开屏或拍 `NORMAL` 时拉起 `_gpu-worker`；拍照前检查 `cma_free_mb()`，若 `< 55 MB` 先 `release()` 空闲 worker，若 `< 45 MB` 直接降级 2MP 避免硬撞内核 `ENOMEM`；切模式统一用 `stop() → configure() → start()`，`_restore_preview()` 必须带超时保护防止 UI 挂死。
+   - **冷启动先亮屏且绝不常驻预热 GPU**：`run()` 里必须先打开 `Framebuffer` 画一帧 `"STARTING CAMERA"`（<50 ms 响应），随后执行可选页缓存清理（仅 `1`、非 root 静默跳过）与同用户 `pcmanfm --desktop` / `wf-panel-pi` 挂起（`finally` 与 `atexit` 保证 `SIGCONT`）；若冷启动 `CmaFree < 45 MB` 则短暂等待最多 1.5 s 让开机瞬态 CMA 释放，再 `self.stream.start()` 进入实时取景。`GpuWorker()` 仅创建轻量控制器，拍照优先保 8MP：若 `CmaFree < 60 MB` 先 `release()` 空闲 worker，仅在 `< 26 MB`（物理不可能）或连续两次 8MP `ENOMEM` 后才兜底降级 2MP；切模式统一用 `stop() → configure() → start()`，`_restore_preview()` 必须带超时保护防止 UI 挂死；`click()` 必须回收已退出的 `aplay` 子进程防僵尸累积；关键阶段统一走 `log_event()` 写带时间戳与内存快照的结构化日志。
 
 ---
 
