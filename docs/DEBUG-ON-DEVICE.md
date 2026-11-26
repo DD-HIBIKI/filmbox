@@ -13,7 +13,7 @@ A dedicated key already exists at `%USERPROFILE%\.ssh\cpz_ed25519` and is in the
 device's `authorized_keys`.
 
 ```powershell
-$cpz = "pi@192.168.1.3"
+$cpz = "pi@<device-ip>"
 $key = "$env:USERPROFILE\.ssh\cpz_ed25519"
 
 # connectivity + identity
@@ -30,7 +30,7 @@ Expected: `HIBIKI`, `aarch64`, and the current time.
 If the address has moved (DHCP), find it again:
 
 ```powershell
-arp -a | Select-String "192.168.1."
+arp -a | Select-String "<lan>."
 ```
 
 or ask the device to print its own address over the existing channel.
@@ -49,13 +49,13 @@ or ask the device to print its own address over the existing channel.
 ## 3. Deploy a change
 
 ```powershell
-$cpz = "pi@192.168.1.3"; $key = "$env:USERPROFILE\.ssh\cpz_ed25519"
+$cpz = "pi@<device-ip>"; $key = "$env:USERPROFILE\.ssh\cpz_ed25519"
 
 # 1. syntax check locally first - a broken file bricks the app until reflashed
-python -m py_compile D:\VibeCoding\2026\2026-11\cardputerzero\cybercam\filmbox.py
+python -m py_compile D:\path\to\cybercam\filmbox.py
 
 # 2. copy up
-scp -i $key D:\VibeCoding\2026\2026-11\cardputerzero\cybercam\filmbox.py "${cpz}:/tmp/filmbox_new.py"
+scp -i $key D:\path\to\cybercam\filmbox.py "${cpz}:/tmp/filmbox_new.py"
 
 # 3. verify what landed
 ssh -i $key -T $cpz "python3 -m py_compile /tmp/filmbox_new.py && echo SYNTAX_OK; md5sum /tmp/filmbox_new.py"
@@ -134,7 +134,7 @@ The user asked for logs to land on the PC after each test round:
 
 ```powershell
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
-$dst = "D:\VibeCoding\2026\2026-11\cardputerzero\cybercam\logs\$stamp"
+$dst = "D:\path\to\cybercam\logs\$stamp"
 New-Item -ItemType Directory -Force $dst | Out-Null
 
 scp -i $key "${cpz}:/home/pi/.local/state/filmbox/camera.log" "$dst\camera.log"

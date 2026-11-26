@@ -1,0 +1,46 @@
+# NOTICE
+
+FilmBox is a fork of **CyberCam v0.5.3** by Cybern0mads
+(<https://github.com/cybern0mads/CyberCam>), MIT licensed.
+The camera layer, film LUT pipeline, zoom, viewfinder and QR export were
+reworked by HIBIKI.
+
+## Film LUTs (`luts/`)
+
+| Files | Origin | License |
+|---|---|---|
+| `fuji_provia`, `fuji_velvia`, `fuji_astia`, `fuji_classic_chrome`, `fuji_pro_neg_std`, `fuji_pro_neg_hi`, `fuji_acros`, `fuji_acros_red`, `kodak_portra_160_vc`, `kodak_portra_400`, `kodak_ektar_100`, `kodak_kodachrome_64`, `kodak_ektachrome_100`, `ilford_hp5_400` | Film simulations generated with **G'MIC** (https://gmic.eu), distributed by YahiaAngelo/Film-Luts | MIT |
+| `look_classic_neg`, `look_nostalgic_neg`, `look_bleach_bypass` | Built for this project: the MIT Provia LUT plus a fitted 8-parameter look layer (`fit_all.py` → `look_params.json` → `build_looks.py`) | MIT |
+| `hasselblad_natural` | Built for this project as a *stylistic approximation*; it is **not** a Hasselblad HNCS reproduction | MIT |
+
+## Camera profiles we deliberately do not ship
+
+Some Fujifilm camera-profile LUTs found online (the `abpy` profiles, and
+Fujifilm's own `.cube` files) have no license that permits redistribution, or
+expect F-Log2/BT.2020 log input. They are not included here.
+
+## Trademarks
+
+Kodak, Portra, Ektar, Ektachrome, Kodachrome, Fujifilm, Provia, Velvia, Astia,
+Classic Chrome, Acros, Ilford, HP5 and Hasselblad are trademarks of their
+respective owners. LUT names describe the intended look only; this project is
+not affiliated with or endorsed by any of those companies.
+
+## Audio
+
+`shutter.wav` is synthesised from scratch by `packaging/make_package.py`
+(two decaying sine pulses plus noise). No third-party sample is used.
+
+## Screenshots
+
+Every screenshot in `screenshots/` was rendered by `tools/mockshots.py` from
+procedurally generated scenes (`tools/gen_scenes.py`). No photograph of a real
+person or place is used.
+
+
+## Acceleration
+
+`filmbox.py` can render film copies on the GPU (EGL surfaceless + GLES2, tiled
+to the driver's maximum texture size) or across CPU cores with `fork`. Both are
+optional and chosen at runtime (`FILMBOX_ACCEL=auto|gpu|multi|cpu`); any failure
+falls back to the single-threaded path in the same file.
