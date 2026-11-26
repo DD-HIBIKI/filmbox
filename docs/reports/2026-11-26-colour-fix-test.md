@@ -119,3 +119,62 @@ produces identical histograms on this pipeline). The iPhone comparison frames
 reach B/G 1.41 in open sky; the module here reaches 1.58 raw and 1.60 after the
 earlier, sky-only correction — so a sky-restricted fix already matches the
 reference closely. What is left is dynamic range, not colour.
+
+---
+
+# Follow-up: commit 6bc07b3 ("Keep colour_fix strictly sky-only")
+
+Tested 2026-11-26 16:35–16:45 Beijing time. md5 `0b0b99df6`, 4896 lines.
+
+## Verdict: the fix is correct
+
+`COLOUR_FIX_PRESETS` now keeps (r, g, b) = (1, 1, 1) and only lifts green where
+`B > G`. Measured on the device:
+
+### Indoor neutral surface (the case that broke MED before)
+
+| | neutral RGB | Δ |
+|---|---|---|
+| raw | 124.2 / 124.8 / 122.7 | — |
+| after MED (0.20) | 124.2 / 124.5 / 123.1 | 0.0 / −0.3 / +0.4 |
+
+The white wall is now **untouched**, which is exactly the guarantee that was
+missing in c53bfd9.
+
+### Real outdoor sky (same scene, device sensor)
+
+| | sky RGB | B/G | target (iPhone 15 Pro) |
+|---|---|---|---|
+| raw | 128 / 129 / 204 | 1.58 | 1.41 |
+| LOW 0.12 | 128 / 138 / 204 | 1.47 | |
+| **MED 0.20** | **128 / 144 / 204** | **1.42** | **1.41** |
+
+MED lands within 0.01 of the iPhone reference. LOW is a visible but softer
+improvement. See `skyfix-presets.jpg`.
+
+### Cost
+
+| | |
+|---|---|
+| `_fix_magenta` on 8 MP | 1.44 s |
+| `_apply_colour_fix` end to end | 2.2 s (decode + fix + q93 re-encode), background thread |
+| Peak RSS delta | +23 MB (256-row bands) |
+
+## Still open
+
+**Preview is still uncorrected.** `filter_image(..., preview=True)` is called at
+lines 2700, 3737 and 4661 without `colour_fix`, so the viewfinder keeps the raw
+magenta sky while the saved frame is corrected. Options: pass the preset to
+preview frames (240×176, ~2 ms) or accept and document the mismatch.
+
+**Default is MED.** Now that MED is sky-only this is defensible — it matched the
+reference outdoors and left the indoor wall alone. Worth one final check on
+warm indoor light (incandescent), where `B > G` also holds for blue-ish shadows.
+
+## Files
+
+| File | What |
+|---|---|
+| `skyfix-presets.jpg` | raw / LOW / MED side by side with measured B/G |
+| `indoor-before-after.jpg` | the earlier c53bfd9 failure, kept for the record |
+| `../tuning/imx219-vc4-skyfix.json` | CCM candidate added alongside this commit (untested) |
