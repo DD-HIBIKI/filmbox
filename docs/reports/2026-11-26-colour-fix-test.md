@@ -178,3 +178,83 @@ warm indoor light (incandescent), where `B > G` also holds for blue-ish shadows.
 | `skyfix-presets.jpg` | raw / LOW / MED side by side with measured B/G |
 | `indoor-before-after.jpg` | the earlier c53bfd9 failure, kept for the record |
 | `../tuning/imx219-vc4-skyfix.json` | CCM candidate added alongside this commit (untested) |
+
+---
+
+# CCM tuning candidate (`imx219-vc4-skyfix.json`): what could and could not be verified
+
+Tested 2026-11-26 16:47–16:55. Device shut down after the run, so the numbers below
+are the last state of a session that started from md5 `0b0b99df6`.
+
+## What the file changes
+
+Only `rpi.ccm`, and only two colour-temperature entries (everything else is byte-identical):
+
+| ct (K) | scenario | G diagonal | G←B coefficient |
+|---|---|---|---|
+| 5858 | daylight | 2.583 → 2.383 | −0.945 → −0.745 |
+| 7580 | shade / deep blue sky | 3.079 → 2.659 | −1.500 → −1.080 |
+
+2856 / 2960 / 3603 / 4650 are untouched, so indoor (tungsten, warm white, fluorescent)
+should be unaffected — confirmed: two frames 0.4 RGB units apart on average.
+
+## Attempt 1 — outdoor at 16:47 (failed to trigger)
+
+```
+ColourTemperature = 4000 K   (needs 5858 or 7580)
+Lux               = 0.18
+ExposureTime      = 66.7 ms
+AnalogueGain      = 9.85
+```
+
+Late November, sun already down. 4000 K falls between the 3603 and 4650 entries, both
+unchanged, so the tuning file had no effect at all: B/G 1.31 vs 1.30 between the two
+shots.
+
+## Attempt 2 — photographing a screen showing #1E90FF (triggered, but not a valid sample)
+
+Framing a monitor full of Dodger Blue at 20–30 cm pushed the AWB estimate to
+**8050 K**, above the 7580 entry, so the modified CCM definitely ran:
+
+```
+ColourTemperature = 8050 K
+Lux               = 612
+```
+
+| | blue region R/G/B | B/G | B − R |
+|---|---|---|---|
+| default tuning | 37.4 / 50.4 / 244.6 | 4.85 | 207 |
+| skyfix | 39.4 / 48.4 / 244.5 | 5.05 | 205 |
+
+The frame changed (R +1.9, G −1.8), but **this says nothing about the sky**. A real sky
+reads B/G ≈ 1.5 and B−R ≈ 60–80; saturated screen blue is 3× beyond that, so the CCM's
+G output clips against zero and the visible difference is clip plus noise, not the matrix.
+
+Back-solving in linear space for an actual sky colour (R128 G129 B204 display) shows the
+matrix does move the right way:
+
+```
+original CCM:  G' ≈ −105.9
+skyfix:        G' ≈  −63.9      (higher green = less violet)
+```
+
+## Conclusion
+
+| Check | Result |
+|---|---|
+| FilmBox loads a custom tuning file | ✅ |
+| AWB lands on the modified 7580 entry at 8050 K | ✅ |
+| Indoor (unchanged entries) is untouched | ✅ (Δ < 0.5) |
+| Direction of the change on a real sky | plausible, unproven |
+| Magnitude on a real sky | **not measurable this session** |
+
+**Do not ship this file as the default until a daylight frame confirms it.** Keep it as
+an opt-in candidate: drop it at `~/.config/filmbox/imx219.json` to try, `FILMBOX_TUNING_FILE=0`
+to force the system default.
+
+## Practical note for the next attempt
+
+Test between 10:00 and 14:00 on a clear day, pointing at open sky with the horizon
+roughly a third of the frame. Check `ColourTemperature` in the capture metadata first —
+if it reads below 5500 K the measurement is worthless, whatever the picture looks like.
+A screen cannot substitute for real sky, as this session demonstrated.
