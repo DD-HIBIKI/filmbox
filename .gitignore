@@ -5,3 +5,5 @@ __pycache__/
 packaging/stage/
 var/
 logs/
+REVIEW*.md
+cybercam-film-share.patch
