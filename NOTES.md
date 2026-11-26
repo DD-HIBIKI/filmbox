@@ -327,3 +327,87 @@ dsh 的 `REVIEW-3.md`（A 0 / B 7 / C 12 / D 8 / E 9）指出我上一轮把 `Fr
 | C6 | `.json.tmp` 残留、父目录未 fsync | 失败清理 + `fsync(dir)` |
 
 真机验证：CLI 720p 录像 4s → 成片 3.96s；日志 `remux: 99 frames in 4.15s = 23.86 fps`（原来是写死 30，成片会快放 25%）。
+
+---
+
+## 一·十七、四轮之后：GPU 真正跑起来、曝光修好、去品红（2026-11-24 ~ 11-26）
+
+### 1. GPU 崩溃的真正原因：`GL_RGB` 写成 `0x1908`
+
+排查了十几轮（纹理尺寸、FBO 绑定、缓冲区生命周期、ctypes 签名、`UNPACK_ALIGNMENT`、uniform 调用、shader 复杂度）全部是伪线索。**根因是一个常量**：
+
+```python
+GL_RGB, GL_RGBA, GL_UBYTE = 0x1908, 0x1908, 0x1401   # 错
+GL_RGB, GL_RGBA, GL_UBYTE = 0x1907, 0x1908, 0x1401   # 对
+```
+
+传 3 字节缓冲、驱动按 4 字节读，每行越界 33% → `vc4` SIGSEGV。Gemini 找到的。
+
+配套三处：
+- 源纹理 `src_tex`(RGB) 与 FBO 目标 `dst_tex`(RGBA) 必须分开（GLES2 反馈环）
+- `glReadPixels` 第 0 行就是图像顶行，**不要**再 `FLIP_TOP_BOTTOM`
+- 颗粒强度要除以 255（GLSL 里 `col` 是 0..1）
+
+### 2. EGL 上下文只能在主线程创建
+
+子线程首次 `eglCreateContext` 会在 C 层直接崩，`try/except` 拦不住，还会把整个进程标记成"无 GPU"。
+
+两代方案：
+1. 启动时主线程 `_gpu_ready()` 同步初始化 → 启动慢 2.7s
+2. **最终版**：`_gpu-worker` 独立子进程持有 EGL，主进程通过管道下发任务 → 启动 3.0s（旧版 5s），GPU 崩了也不带崩相机
+
+### 3. 曝光才是"天空偏紫"的主因
+
+拍 still 时切传感器模式会让 AE 归零，而代码只 `time.sleep(0.08)` 就抓帧。结果随机：
+
+| 拍到的 | 天空 RGB | 表现 |
+|---|---|---|
+| 欠曝 3 档 | 47/55/118 | B/G 2.14 → 深紫 |
+| 过曝 | 181/175/208 | R/G 已削顶 → 发白偏品红 |
+
+`_wait_for_exposure()` 循环读 `capture_metadata()`，直到 `ExposureTime` 与 `AnalogueGain` 连续两次变化 <4%（最多等 2.5s，通常 0.5–1s）。修完后与自带相机吻合（B/G 1.36/1.60/1.37 vs 1.40/1.58/1.32）。
+
+### 4. 去品红：把绿通道补到蓝通道里
+
+自然天空是 `R<G<B`，IMX219 给的是 `R≈G<B`（G 少 ~30）。所以不是饱和度问题（iPhone 反而更饱和），是色相。
+
+```python
+lift = max(0, B - G) * gain      # 只在蓝占优的像素生效
+G += lift
+```
+
+`gain` 分四档 `colour_fix = 0/1/2/3`（0/0.18/0.28/0.36，默认 2）。
+
+**踩的坑**：第一版一次性处理 8MP，`arr.copy()` + 多个 int16 临时数组峰值 85MB、耗时 1.9s，而且**同步跑在拍照流程里**——内存一紧就卡死（NORMAL 模式也卡，因为没有滤镜分支）。改为 512 行分块（峰值 ~28MB）+ 移到 `film_job` 渲染线程，NORMAL 完全不动原图。
+
+### 5. HDR 这条线走不通
+
+`HdrMode` 控件存在（0–4）且都能设，但实测：
+
+```
+0/1/2 → 直方图完全相同（121/23/142/201）
+3     → 极暗（mean 26，21% 像素全黑）
+4     → 略亮（mean 147）
+```
+
+pipeline 没有真正的多帧合成。要接近 iPhone 只能自己 bracket + 融合，成本高且有鬼影，暂不做。
+
+### 6. 内存相关的既有结论
+
+| 项 | 改动 | 收益 |
+|---|---|---|
+| `gpu_mem` | 128 → 64 | MemTotal 361 → **415 MB** |
+| CMA | cma-64 → cma-128 | 8MP 连拍不再失败 |
+| `malloc_trim(0)` | 渲染后/拍照前调用 | 连续 5 张全 8MP，内存稳定 174–180MB |
+
+⚠️ `/tmp` 是 208MB tmpfs，放大文件等于直接吃内存（曾有两个 100MB 的 wav 把可用内存压掉一半）。
+
+### 7. 商店
+
+PR [CardputerZero/packages#799](https://github.com/CardputerZero/packages/pull/799)：`filmbox 0.9.0`，CI `validate`+`capture` 全过，演示视频已内嵌，等人工合并（队里 39 个）。
+
+### 8. 已知未解决
+
+- **worker 反复重启**：日志连续 `GPU worker ready`，渲染从 2.9s 变 7.67s。怀疑 `pkill -9` 留下孤儿进程导致接管冲突，待重启设备后确认
+- **NORMAL 模式不修图**：故意为之（避免卡死），原图仍是偏品红的
+- GitHub 落后 PC 两个提交（用户要求暂不推）
