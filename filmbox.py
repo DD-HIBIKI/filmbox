@@ -16,13 +16,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import html
-import hmac
-import mimetypes
 import queue
-import secrets
 import tempfile
-import urllib.parse
 import weakref
 from functools import lru_cache
 import array
@@ -40,7 +35,6 @@ from pathlib import Path
 import select
 import shutil
 import signal
-import socket
 import struct
 import subprocess
 import sys
@@ -49,15 +43,23 @@ import time
 from datetime import datetime
 from collections import deque
 
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageFilter
 
-# Skip heavy UI/web/NumPy imports in the on-demand `_gpu-worker` subprocess:
-# cuts worker RSS by ~24 MB (59 MB -> ~35 MB) and speeds up cold EGL launch.
+# Skip heavy UI/web/crypto/NumPy imports in the on-demand `_gpu-worker` subprocess:
+# avoids loading libcrypto.so.3 (~4 MB), evdev, http.server, and unused PIL modules,
+# cutting worker RSS and speeding up cold EGL launch.
 _IS_GPU_WORKER = len(sys.argv) >= 2 and sys.argv[1] == "_gpu-worker"
 
 if not _IS_GPU_WORKER:
+    import html
+    import hmac
+    import mimetypes
+    import secrets
+    import socket
+    import urllib.parse
     from http import cookies
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from PIL import ImageDraw, ImageEnhance, ImageFont, ImageOps
     try:
         from evdev import InputDevice, ecodes, list_devices
     except ImportError:
@@ -65,9 +67,11 @@ if not _IS_GPU_WORKER:
         ecodes = None
         list_devices = None
 else:
+    html = hmac = mimetypes = secrets = socket = None
     cookies = None
     BaseHTTPRequestHandler = object
     ThreadingHTTPServer = None
+    ImageDraw = ImageEnhance = ImageFont = ImageOps = None
     InputDevice = None
     ecodes = None
     list_devices = None
@@ -1914,7 +1918,7 @@ def command_gpu_worker():
         try:
             raw_line = req_q.get(timeout=idle_sec) if idle_sec > 0 else req_q.get()
         except queue.Empty:
-            emit({"event": "idle_exit"})
+            emit({"event": "idle_exit", "idle_s": round(idle_sec, 1)})
             break
         if raw_line is None:
             break
@@ -2095,7 +2099,8 @@ class GpuWorker:
                         idle_exited = True
                         if self.state != "stopped":
                             self.state = "idle"
-                        log_event("GPU", f"worker idle-exited after {GPU_WORKER_IDLE_SEC:.0f}s | {mem_snapshot()}")
+                        idle_s = msg.get("idle_s", GPU_WORKER_IDLE_SEC)
+                        log_event("GPU", f"worker idle-exited after {idle_s:g}s | {mem_snapshot()}")
                     elif ev == "fail":
                         explicit_fail = True
                         self.state = "failed"
