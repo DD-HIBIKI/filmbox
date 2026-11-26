@@ -29,6 +29,10 @@ for cube in sorted((project / "luts").glob("*.cube")):
     shutil.copy2(cube, root / "usr/share/filmbox/luts" / cube.name)
 if (project / "luts" / "README.md").exists():
     shutil.copy2(project / "luts" / "README.md", root / "usr/share/filmbox/luts/README.md")
+for tuning_src in (project / "tuning" / "imx219.json", project / "imx219.json"):
+    if tuning_src.is_file():
+        shutil.copy2(tuning_src, root / "usr/share/filmbox/imx219.json")
+        break
 
 (root / "usr/bin/filmbox").write_text(
     '#!/bin/sh\nexec /usr/bin/python3 /usr/lib/filmbox/filmbox.py "$@"\n',

@@ -33,7 +33,8 @@ CameraStream
 ## 功能
 
 - **胶片 LUT**：内置 `/usr/share/filmbox/luts/*.cube`（用户可在 `~/.config/filmbox/luts/*.cube` 新增或覆盖），`5` 打开选择器（内置滤镜 + LUT，右侧实时预览）
-- **胶片副本**：LUT → halation（彩色暖光晕 / 黑白银盐中性光晕）→ grain（按亮度调制的颗粒）→ JPEG，原片保留
+- **胶片副本**：偏色修正（融合进 GPU 着色器，0 额外开销）→ LUT → halation（彩色暖光晕 / 黑白银盐中性光晕）→ grain（按亮度调制的颗粒）→ JPEG，原片保留
+- **偏色修正 & 硬件 ISP 调优**：内置 4 档软件修正（`filmbox config --colour-fix 0..3`），并自动加载自定义 `imx219.json`（`~/.config/filmbox/imx219.json` 或 `/usr/share/filmbox/imx219.json`），详见 [`docs/IMX219_TUNING.md`](docs/IMX219_TUNING.md)
 - **变焦**：`Z` 循环 1x/1.5x/2x/3x，照片按同样倍率软件裁切（不放大）
 - **扫码导出**：`W` 起局域网相册（token 保护）+ 全屏二维码，手机扫码下载
 - **相册删除**：`DEL` 两次确认
@@ -101,6 +102,7 @@ build_looks.py   Provia + 参数层 → luts/look_*.cube（只需仓库内文件
 |---|---|
 | `README.md` | 本文件：项目概览、实机数据、安装 |
 | `AGENTS.md` | 开发红线与防踩坑指南（Minis / 协作开发必读） |
+| `docs/IMX219_TUNING.md` | IMX219 偏色分析、软件 4 档修正与自定义 `imx219.json` 调优指南 |
 | `NOTES.md` | 改动记录 16 节（含每个坑的原因与修法） |
 | `REVIEW.md` / `REVIEW-2.md` / `REVIEW-3.md` / `REVIEW-4.md` | 四轮代码审计与修复记录 |
 | `REVIEW-RESPONSE.md` | 第一轮的逐条处理记录 |

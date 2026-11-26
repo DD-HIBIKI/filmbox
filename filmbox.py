@@ -193,9 +193,116 @@ def timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
+COLOUR_FIX_NONE = (1.0, 1.0, 1.0, 0.0)
+# (r_mul, g_mul, b_mul, sky_lift): neutralizes IMX219 global red/magenta cast
+# (weak IR-cut + AWB bias) plus residual blue-sky violet lift.
+COLOUR_FIX_PRESETS = (
+    (1.00, 1.00, 1.00, 0.00),  # 0: OFF
+    (0.95, 1.03, 1.00, 0.09),  # 1: LOW  (gentle; safest for warm indoor skin)
+    (0.91, 1.05, 1.00, 0.14),  # 2: MED  (default; best match vs iPhone 15 Pro)
+    (0.87, 1.07, 1.00, 0.19),  # 3: HIGH (strong daylight / heavy IR leakage)
+)
+
+
+def _normalize_colour_fix(spec):
+    """Normalize colour-fix spec to (r_mul, g_mul, b_mul, sky_lift)."""
+    if spec is None or isinstance(spec, bool):
+        return COLOUR_FIX_NONE
+    if isinstance(spec, (tuple, list)) and len(spec) == 4:
+        r, g, b, sky = (float(x) for x in spec)
+        return (
+            max(0.5, min(1.5, r)),
+            max(0.5, min(1.5, g)),
+            max(0.5, min(1.5, b)),
+            max(0.0, min(1.0, sky)),
+        )
+    if isinstance(spec, (int, float)):
+        return (1.0, 1.0, 1.0, max(0.0, min(1.0, float(spec))))
+    return COLOUR_FIX_NONE
+
+
+def _colour_fix_active(spec):
+    r, g, b, sky = _normalize_colour_fix(spec)
+    return sky > 0.0 or abs(r - 1.0) > 1e-4 or abs(g - 1.0) > 1e-4 or abs(b - 1.0) > 1e-4
+
+
+def colour_fix_spec(settings):
+    if not isinstance(settings, dict):
+        return COLOUR_FIX_PRESETS[2]
+    idx = settings.get("colour_fix", 2)
+    if isinstance(idx, bool) or not isinstance(idx, int) or not (0 <= idx < len(COLOUR_FIX_PRESETS)):
+        idx = 2
+    return COLOUR_FIX_PRESETS[idx]
+
+
+def resolve_tuning_file():
+    """Return an active custom IMX219 libcamera tuning JSON path, or None.
+
+    Lookup priority (VC4 ISP only on Cardputer Zero / CM0):
+      1. FILMBOX_TUNING_FILE ("0"/"off"/"none"/"default" forces system default)
+      2. LIBCAMERA_RPI_TUNING_FILE
+      3. ~/.config/filmbox/imx219.json
+      4. <app_dir>/tuning/imx219.json or <app_dir>/imx219.json
+      5. /usr/share/filmbox/imx219.json
+    Malformed files are logged and ignored so a bad JSON never breaks capture.
+    """
+    env_fb = os.environ.get("FILMBOX_TUNING_FILE", "").strip()
+    if env_fb.lower() in ("0", "off", "none", "default"):
+        return None
+    candidates = []
+    if env_fb:
+        candidates.append(Path(env_fb).expanduser())
+    env_lc = os.environ.get("LIBCAMERA_RPI_TUNING_FILE", "").strip()
+    if env_lc:
+        candidates.append(Path(env_lc).expanduser())
+    app_dir = Path(__file__).resolve().parent
+    candidates.extend((
+        CONFIG.parent / "imx219.json",
+        app_dir / "tuning" / "imx219.json",
+        app_dir / "imx219.json",
+        Path("/usr/share/filmbox/imx219.json"),
+    ))
+    for cand in candidates:
+        try:
+            if not cand.is_file():
+                continue
+            data = json.loads(cand.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return cand
+            with camera_log() as log:
+                log.write(("FilmBox tuning ignored (not a JSON object): %s\n"
+                           % cand).encode())
+        except Exception as exc:
+            with camera_log() as log:
+                log.write(("FilmBox tuning ignored (%s): %s\n"
+                           % (cand, exc)).encode())
+    return None
+
+
+def _load_picam_tuning(picam_cls):
+    """Load custom tuning dict for Picamera2, falling back to None on any error."""
+    path = resolve_tuning_file()
+    if path is None:
+        return None
+    try:
+        try:
+            return picam_cls.load_tuning_file(path.name, dir=str(path.parent))
+        except TypeError:
+            return picam_cls.load_tuning_file(str(path))
+    except Exception as exc:
+        with camera_log() as log:
+            log.write(("FilmBox tuning load failed (%s): %s\n"
+                       % (path, exc)).encode())
+        return None
+
+
 def load_settings():
     refresh_filters()
-    defaults = {"sound": True, "filter": "NORMAL", "resolution": 0, "video": 0, "rotation": 180, "preview_fps": 25, "timelapse_interval": 1, "lut_full_res": True, "clean_ui": False, "zoom": 1.0}
+    defaults = {
+        "sound": True, "filter": "NORMAL", "resolution": 0, "video": 0,
+        "rotation": 180, "preview_fps": 25, "timelapse_interval": 1,
+        "lut_full_res": True, "clean_ui": False, "zoom": 1.0, "colour_fix": 2,
+    }
     try:
         values = json.loads(CONFIG.read_text())
         defaults.update({k: values[k] for k in defaults if k in values})
@@ -203,7 +310,9 @@ def load_settings():
         pass
     if defaults["filter"] not in FILTERS:
         defaults["filter"] = "NORMAL"
-    if defaults.get("colour_fix") not in (0, 1, 2, 3):
+    if isinstance(defaults.get("colour_fix"), bool) or not isinstance(
+            defaults.get("colour_fix"), int) or not (
+            0 <= defaults["colour_fix"] < len(COLOUR_FIX_PRESETS)):
         defaults["colour_fix"] = 2
     if isinstance(defaults.get("timelapse_interval"), bool) or not isinstance(
             defaults.get("timelapse_interval"), int) or not (
@@ -499,25 +608,35 @@ def add_grain(image, strength=5.0, seed=None):
     return rgb
 
 
-def filter_image(source, mode, animated=False, preview=False):
+def filter_image(source, mode, animated=False, preview=False, colour_fix=COLOUR_FIX_NONE):
     """Efficient retro effects. Still photos preserve original dimensions/ratio.
 
     Pixel/detail deliberately reduced for vintage look; resizing doesn't add detail.
     """
+    cf = _normalize_colour_fix(colour_fix)
+    cf_on = _colour_fix_active(cf)
     if mode.startswith(LUT_PREFIX):
         # 3D LUT: full resolution, no downscale. Preview frames are already LCD-size.
         try:
             lut = load_cube_lut(str(resolve_lut_path(mode[len(LUT_PREFIX):])))
-            return source.convert("RGB").filter(lut)
+            rgb = source.convert("RGB")
+            if cf_on:
+                _fix_magenta(rgb, cf)
+            return rgb.filter(lut)
         except (OSError, ValueError):
-            return source.convert("RGB").copy()
+            rgb = source.convert("RGB")
+            return _fix_magenta(rgb, cf) if cf_on else rgb
 
     if mode == "NORMAL":
         if animated:
-            return preview_size(source, (240, 176))
-        return source.convert("RGB").copy()
+            out = preview_size(source, (240, 176))
+        else:
+            out = source.convert("RGB")
+        return _fix_magenta(out, cf) if cf_on else out
     if mode in ("MONO", "HICON"):
-        working = preview_size(source, (240,176)) if animated else source.convert("RGB")
+        working = preview_size(source, (240, 176)) if animated else source.convert("RGB")
+        if cf_on:
+            _fix_magenta(working, cf)
         gray = ImageOps.autocontrast(working.convert("L"))
         if mode == "HICON":
             gray = ImageEnhance.Contrast(gray).enhance(2.0)
@@ -535,6 +654,8 @@ def filter_image(source, mode, animated=False, preview=False):
             scale = min(1.0, 820/source.width, 616/source.height)
             base = source.convert("RGB").resize((max(1, int(source.width*scale)),
                 max(1, int(source.height*scale))), Image.Resampling.BOX)
+        if cf_on:
+            base = _fix_magenta_band(base, cf)
         out = creative_filter(base, mode)
         if not animated and not preview and out.size != original_size:
             out = out.resize(original_size, Image.Resampling.NEAREST)
@@ -553,6 +674,8 @@ def filter_image(source, mode, animated=False, preview=False):
         # 4x block-dither on an 8 MP JPEG (820x616) is practical on 512 MB RAM.
         target = (min(source.width, 820), min(source.height, 616))
         base = source.resize(target, Image.Resampling.BOX).convert("RGB")
+    if cf_on:
+        base = _fix_magenta_band(base, cf)
 
     if mode == "PIXEL":
         thumb = base.resize((max(1, target[0] // 4), max(1, target[1] // 4)), Image.Resampling.BOX)
@@ -771,6 +894,7 @@ uniform vec2 imgSize;
 uniform float n;             // LUT edge (13 or 33)
 uniform float grainAmp;      // normalized grey amplitude (0..1)
 uniform float glowMix;       // 0 disables halation
+uniform vec4 colourFix;      // (rMul, gMul, bMul, skyLift); (1,1,1,0) disables
 uniform vec2 uvScale;        // active content ratio vs allocated tile texture
 
 float hash(vec2 p){
@@ -781,6 +905,8 @@ float hash(vec2 p){
 void main(){
   vec2 uv = vUv * uvScale;
   vec3 c = texture2D(tex, uv).rgb;
+  c = clamp(c * colourFix.rgb, 0.0, 1.0);
+  c.g = min(1.0, c.g + max(0.0, c.b - c.g) * colourFix.w);
 
   // 3D LUT from a 2D atlas: x = b*n + r, y = g
   float b = clamp(c.b, 0.0, 1.0) * (n - 1.0);
@@ -869,6 +995,7 @@ class GpuFilm:
             gl.glUniform1i.argtypes = [i, i]
             gl.glUniform1f.argtypes = [i, f]
             gl.glUniform2f.argtypes = [i, f, f]
+            gl.glUniform4f.argtypes = [i, f, f, f, f]
             gl.glGetUniformLocation.argtypes = [u, ctypes.c_char_p]
             gl.glGetUniformLocation.restype = i
             maxt = ctypes.c_int()
@@ -912,7 +1039,7 @@ class GpuFilm:
 
             self.uniforms = {}
             for name in (b"tex", b"lut", b"glow", b"blockSize", b"blockOrigin",
-                         b"imgSize", b"n", b"grainAmp", b"glowMix", b"uvScale"):
+                         b"imgSize", b"n", b"grainAmp", b"glowMix", b"colourFix", b"uvScale"):
                 self.uniforms[name.decode()] = gl.glGetUniformLocation(self.prog, name)
             quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
             self._quad = quad
@@ -991,29 +1118,35 @@ class GpuFilm:
             self._glow_alloc_size = size_wh
         self._glow_ref = weakref.ref(glow)
 
-    def apply_band(self, block, top, w, h, cube_path, glow, grain=5.0):
+    def apply_band(self, block, top, w, h, cube_path, glow, grain=5.0,
+                   colour_fix=COLOUR_FIX_NONE):
         """Render one horizontal band with the shared LUT and glow textures."""
         with _ACCEL_LOCK:
             self._make_current()
             try:
-                return self._render_tiles(block, top, w, h, cube_path, glow, grain)
+                return self._render_tiles(block, top, w, h, cube_path, glow, grain,
+                                          colour_fix=colour_fix)
             finally:
                 self._release_current()
 
     def _render_tiles(self, rgb, origin_top, full_w, full_h, cube_path, glow, grain,
-                      progress=None, inplace=False):
+                      progress=None, inplace=False, colour_fix=COLOUR_FIX_NONE):
         self._upload_lut(cube_path)
         self._upload_glow(glow)
         gl = self.gl
         tile = self.tile
         bw, bh = rgb.size
         grain_norm = max(0.0, float(grain)) * 1.2 / 255.0
+        cf_r, cf_g, cf_b, cf_sky = _normalize_colour_fix(colour_fix)
         gl.glUseProgram(self.prog)
         gl.glVertexAttribPointer(self.pos_loc, 2, GL_FLOAT, 0, 0, self._quad)
         gl.glEnableVertexAttribArray(self.pos_loc)
         gl.glUniform1f(self.uniforms["n"], ctypes.c_float(self.lut_size))
         gl.glUniform1f(self.uniforms["grainAmp"], ctypes.c_float(grain_norm))
         gl.glUniform1f(self.uniforms["glowMix"], ctypes.c_float(1.0 if glow is not None else 0.0))
+        gl.glUniform4f(self.uniforms["colourFix"],
+                       ctypes.c_float(cf_r), ctypes.c_float(cf_g),
+                       ctypes.c_float(cf_b), ctypes.c_float(cf_sky))
         gl.glUniform2f(self.uniforms["imgSize"], ctypes.c_float(full_w), ctypes.c_float(full_h))
         gl.glBindFramebuffer(GL_FBO, self.fb)
         gl.glActiveTexture(GL_TEXTURE0)
@@ -1084,14 +1217,20 @@ class GpuFilm:
         arr = np.frombuffer(data, dtype=np.uint8).reshape(size, size, size, 3)
         return np.ascontiguousarray(arr.transpose(1, 0, 2, 3).reshape(size, size * size, 3)).tobytes()
 
-    def apply(self, image, cube_path, halation=True, grain=5.0, progress=None):
+    def apply(self, image, cube_path, halation=True, grain=5.0, progress=None,
+              colour_fix=COLOUR_FIX_NONE):
         rgb = image if image.mode == "RGB" else image.convert("RGB")
         w, h = rgb.size
+        cf = _normalize_colour_fix(colour_fix)
         glow = None
         if halation:
             mono = is_monochrome_cube(cube_path)
             sw, sh = max(1, w // 4), max(1, h // 4)
-            small_graded = rgb.resize((sw, sh), Image.Resampling.BOX).filter(load_cube_lut(str(cube_path)))
+            small = rgb.resize((sw, sh), Image.Resampling.BOX)
+            if _colour_fix_active(cf):
+                small = _fix_magenta_band(small, cf)
+            small_graded = small.filter(load_cube_lut(str(cube_path)))
+            del small
             glow = build_glow(small_graded, monochrome=mono)
             del small_graded
         if progress is not None:
@@ -1100,7 +1239,8 @@ class GpuFilm:
             self._make_current()
             try:
                 return self._render_tiles(rgb, 0, w, h, cube_path, glow, grain,
-                                          progress=progress, inplace=True)
+                                          progress=progress, inplace=True,
+                                          colour_fix=cf)
             finally:
                 self._glow_ref = None
                 self._release_current()
@@ -1112,7 +1252,11 @@ _MP = {}
 def _band_lut(job):
     top, bottom = job
     img, lut = _MP["img"], _MP["lut"]
-    return top, bottom, img.crop((0, top, img.width, bottom)).filter(lut).tobytes()
+    block = img.crop((0, top, img.width, bottom))
+    cf = _MP.get("colour_fix", COLOUR_FIX_NONE)
+    if _colour_fix_active(cf):
+        block = _fix_magenta_band(block, cf)
+    return top, bottom, block.filter(lut).tobytes()
 
 
 def _band_finish(job):
@@ -1154,7 +1298,8 @@ class MultiCoreFilm:
     def __init__(self, jobs=None):
         self.jobs = jobs or min(2, os.cpu_count() or 1)
 
-    def apply(self, image, cube_path, halation=True, grain=5.0, lut_obj=None):
+    def apply(self, image, cube_path, halation=True, grain=5.0, lut_obj=None,
+              colour_fix=COLOUR_FIX_NONE):
         if lut_obj is None:
             size, data, _ = read_cube(cube_path)
             lut_obj = ImageFilter.Color3DLUT(size, [v / 255.0 for v in
@@ -1181,7 +1326,8 @@ class MultiCoreFilm:
         bands = [(i * h // jobs, (i + 1) * h // jobs) for i in range(jobs)]
         ctx = mp.get_context("fork")
         _MP.clear()
-        _MP.update(img=rgb, lut=lut_obj, glow=None, grain=grain)
+        _MP.update(img=rgb, lut=lut_obj, glow=None, grain=grain,
+                   colour_fix=_normalize_colour_fix(colour_fix))
         with ctx.Pool(jobs) as pool:
             parts = pool.map(_band_lut, bands)
         stage = Image.new("RGB", (w, h))
@@ -1230,17 +1376,21 @@ _GPU = None
 _GPU_STATE = 0            # 0 untried, 1 ready, 2 unavailable
 
 
-def film_copy(image, cube_path, progress=None, gpu_budget=None):
-    """Apply LUT + halation + grain with the best available engine.
+def film_copy(image, cube_path, progress=None, gpu_budget=None,
+              colour_fix=COLOUR_FIX_NONE):
+    """Apply colour fix + LUT + halation + grain with the best available engine.
 
     Order: GPU → multi-core → single-threaded CPU.  Any failure falls through,
     and the choice is logged so `filmbox diagnose` can show what was used.
     """
     global _GPU, _GPU_STATE
+    cf = _normalize_colour_fix(colour_fix)
+    cf_on = _colour_fix_active(cf)
     free_now = available_mb() if gpu_budget is None else gpu_budget
     if _gpu_ready(image.width * image.height, free_now):
         try:
-            out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH, progress=progress)
+            out = _GPU.apply(image, str(cube_path), True, GRAIN_STRENGTH,
+                             progress=progress, colour_fix=cf)
             if progress:
                 progress(90)
             return out
@@ -1251,7 +1401,8 @@ def film_copy(image, cube_path, progress=None, gpu_budget=None):
     if _ACCEL in ("auto", "multi", "gpu"):
         try:
             lut = load_cube_lut(str(cube_path))
-            out = MultiCoreFilm().apply(image, str(cube_path), True, GRAIN_STRENGTH, lut)
+            out = MultiCoreFilm().apply(image, str(cube_path), True, GRAIN_STRENGTH,
+                                        lut, colour_fix=cf)
             if out is not None:
                 if progress:
                     progress(90)
@@ -1265,7 +1416,10 @@ def film_copy(image, cube_path, progress=None, gpu_budget=None):
     step = 256
     for top in range(0, h, step):
         bottom = min(h, top + step)
-        result.paste(result.crop((0, top, w, bottom)).filter(lut), (0, top))
+        block = result.crop((0, top, w, bottom))
+        if cf_on:
+            block = _fix_magenta_band(block, cf)
+        result.paste(block.filter(lut), (0, top))
         if progress:
             progress(min(60, (top + step) * 60 // max(1, h)))
     result = add_halation(result, monochrome=is_monochrome_cube(cube_path))
@@ -1302,17 +1456,22 @@ def _raw_prepare(original, workdir):
     return raw, small, w, h, sw, sh
 
 
-def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None):
+def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None,
+                  colour_fix=COLOUR_FIX_NONE):
     """Streaming film copy: per-tile reads from mmap, one output buffer."""
     step = 512
     out = Image.new("RGB", (w, h))
     row = w * 3
     lut = load_cube_lut(str(cube_path))
     mono = is_monochrome_cube(cube_path)
+    cf = _normalize_colour_fix(colour_fix)
+    cf_on = _colour_fix_active(cf)
     with open(raw, "rb") as handle:
         mm = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
         with open(small, "rb") as sh_handle:
             thumb = Image.frombuffer("RGB", (sw, sh), sh_handle.read(), "raw", "RGB", 0, 1)
+            if cf_on:
+                thumb = _fix_magenta_band(thumb, cf)
             glow = build_glow(thumb.filter(lut), monochrome=mono)
         gpu = _gpu_ready(w * h, available_mb())
         done = 0
@@ -1320,7 +1479,7 @@ def film_copy_raw(raw, small, w, h, sw, sh, cube_path, progress=None):
             rows = min(step, h - top)
             block = Image.frombuffer("RGB", (w, rows), mm[top * row:(top + rows) * row],
                                      "raw", "RGB", 0, 1)
-            band = _render_band(block, top, w, h, cube_path, glow, gpu)
+            band = _render_band(block, top, w, h, cube_path, glow, gpu, colour_fix=cf)
             out.paste(band, (0, top))
             done += rows
             if progress:
@@ -1356,15 +1515,19 @@ def _gpu_ready(pixels, free_mb=None):
     return _GPU_STATE == 1
 
 
-def _render_band(block, top, w, h, cube_path, glow, use_gpu):
+def _render_band(block, top, w, h, cube_path, glow, use_gpu, colour_fix=COLOUR_FIX_NONE):
     """One horizontal band of the film copy, sharing the glow texture."""
+    cf = _normalize_colour_fix(colour_fix)
     if use_gpu:
         try:
-            return _GPU.apply_band(block, top, w, h, str(cube_path), glow, GRAIN_STRENGTH)
+            return _GPU.apply_band(block, top, w, h, str(cube_path), glow, GRAIN_STRENGTH,
+                                   colour_fix=cf)
         except Exception as exc:
             with camera_log() as log:
                 log.write(("FilmBox accel: GPU band failed (%s)\n" % exc).encode())
     lut = load_cube_lut(str(cube_path))
+    if _colour_fix_active(cf):
+        block = _fix_magenta_band(block, cf)
     band = block.filter(lut)
     if glow is not None:
         sw, sh = glow.size
@@ -1376,9 +1539,11 @@ def _render_band(block, top, w, h, cube_path, glow, use_gpu):
     return add_grain(band, GRAIN_STRENGTH, seed=top)
 
 
-def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=None):
+def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=None,
+                         colour_fix=COLOUR_FIX_NONE):
     """Decode JPEG, apply GpuFilm with 2MP memory fallback, and save atomically."""
     original = Path(original)
+    cf = _normalize_colour_fix(colour_fix)
     room_for_full = available_mb() >= 130
     decode_mb = 24 if (want_full and room_for_full) else 6
     gpu_budget = available_mb() - decode_mb
@@ -1400,7 +1565,8 @@ def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=Non
     if image.width * image.height > GPU_MAX_PIXELS:
         return None, "too_large"
     try:
-        result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH, progress=progress)
+        result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH,
+                           progress=progress, colour_fix=cf)
     except (MemoryError, OSError) as exc:
         with camera_log() as log:
             log.write(("FilmBox GPU memory fallback: %s | %s\n"
@@ -1411,7 +1577,8 @@ def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=Non
                              Image.Resampling.BOX)
         del image
         image = small
-        result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH, progress=progress)
+        result = gpu.apply(image, str(cube_path), True, GRAIN_STRENGTH,
+                           progress=progress, colour_fix=cf)
     tag = "" if max(result.size) > max(LUT_SAVE_MAX) else "_%dmp" % round(
         result.width * result.height / 1e6)
     out_path = original.with_name(original.stem + "_" +
@@ -1472,6 +1639,7 @@ def command_gpu_worker():
                 req["cube"],
                 bool(req.get("full_res", True)),
                 progress=lambda pct: emit({"event": "progress", "pct": int(pct)}),
+                colour_fix=_normalize_colour_fix(req.get("colour_fix")),
             )
             if out_path is None:
                 emit({"event": "fallback", "reason": reason or "budget"})
@@ -1594,7 +1762,8 @@ class GpuWorker:
                 self._cond.notify_all()
 
     def render(self, original, mode, cube_path, full_res=True, progress=None,
-               on_status=None, wait_timeout=10.0, render_timeout=60.0):
+               on_status=None, wait_timeout=10.0, render_timeout=60.0,
+               colour_fix=COLOUR_FIX_NONE):
         """Render a LUT copy in the background GPU worker.
 
         If the worker is still warming up on the first shot, notifies the UI
@@ -1632,6 +1801,7 @@ class GpuWorker:
                 "mode": mode,
                 "cube": str(cube_path),
                 "full_res": bool(full_res),
+                "colour_fix": list(_normalize_colour_fix(colour_fix)),
             }
             try:
                 self.proc.stdin.write(json.dumps(req) + "\n")
@@ -1725,36 +1895,84 @@ def _atomic_save_image(image, path, fmt=None, **kwargs):
                 pass
 
 
-def _fix_magenta(image, gain=0.28, step=512):
-    """Pull green up where blue dominates, band by band.
+@lru_cache(maxsize=16)
+def _channel_mul_lut(mul):
+    if np is None:
+        return [min(255, int(v * mul + 0.5)) for v in range(256)]
+    vals = np.rint(np.arange(256, dtype=np.float32) * float(mul))
+    return np.clip(vals, 0, 255).astype(np.uint8)
 
-    The IMX219 feed renders clear sky as R≈G<B (magenta-leaning) while a natural
-    sky is R<G<B. Adding a fraction of (B-G) to G in those areas fixes the cast
-    without touching greens, skin or neutrals, where B≈G.
 
-    Works in horizontal bands: an 8 MP copy plus int16 temporaries needs ~85 MB,
-    which is enough to stall this board, while a 512-row band needs ~4 MB.
+def _fix_magenta_band(band, spec=COLOUR_FIX_PRESETS[2]):
+    """Apply IMX219 WB channel LUTs + uint16 blue-sky green lift (~2.5 MB/band).
+
+    Accepts either a 4-tuple (r_mul, g_mul, b_mul, sky_lift) or a legacy scalar
+    sky_lift float. Uses 256-byte LUT lookups for channel scaling and masked
+    uint16 fixed-point arithmetic for sky lift (zero float64 arrays).
     """
-    if np is None or gain <= 0:
+    r_mul, g_mul, b_mul, sky_k = _normalize_colour_fix(spec)
+    has_r = abs(r_mul - 1.0) > 1e-4
+    has_g = abs(g_mul - 1.0) > 1e-4
+    has_b = abs(b_mul - 1.0) > 1e-4
+    has_wb = has_r or has_g or has_b
+    k = int(round(sky_k * 256))
+    if not has_wb and k <= 0:
+        return band
+    rgb = band if band.mode == "RGB" else band.convert("RGB")
+    if np is None:
+        if has_wb:
+            lut = _channel_mul_lut(r_mul) + _channel_mul_lut(g_mul) + _channel_mul_lut(b_mul)
+            return rgb.point(lut)
+        return rgb
+    arr = np.array(rgb, dtype=np.uint8)
+    changed = False
+    if has_r:
+        arr[:, :, 0] = _channel_mul_lut(r_mul)[arr[:, :, 0]]
+        changed = True
+    if has_g:
+        arr[:, :, 1] = _channel_mul_lut(g_mul)[arr[:, :, 1]]
+        changed = True
+    if has_b:
+        arr[:, :, 2] = _channel_mul_lut(b_mul)[arr[:, :, 2]]
+        changed = True
+    if k > 0:
+        g = arr[:, :, 1]
+        b = arr[:, :, 2]
+        mask = b > g
+        if mask.any():
+            diff = b[mask].astype(np.uint16) - g[mask].astype(np.uint16)
+            g[mask] = np.minimum(
+                255, g[mask].astype(np.uint16) + ((diff * k + 128) >> 8)
+            ).astype(np.uint8)
+            changed = True
+    return Image.fromarray(arr, "RGB") if changed else rgb
+
+
+def _fix_magenta(image, spec=COLOUR_FIX_PRESETS[2], step=256):
+    """Apply IMX219 colour correction in-place, 256 rows at a time (~3 MB temp RAM).
+
+    Compensates the IMX219 module's global red/magenta cast (weak IR-cut + AWB
+    bias) via 256-byte per-channel LUTs and lifts residual blue-sky violet cast
+    where B > G.
+    """
+    cf = _normalize_colour_fix(spec)
+    if not _colour_fix_active(cf):
         return image
     rgb = image if image.mode == "RGB" else image.convert("RGB")
-    arr = np.array(rgb)                      # writable copy, 24 MB at 8 MP
-    h = arr.shape[0]
+    w, h = rgb.size
     for top in range(0, h, step):
-        blk = arr[top:top + step]
-        b = blk[:, :, 2].astype(np.int16)
-        g = blk[:, :, 1].astype(np.int16)
-        lift = np.clip(b - g, 0, None)
-        if not lift.any():
-            continue
-        lift = (lift * gain).astype(np.int16)
-        blk[:, :, 1] = np.clip(g + lift, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
+        bottom = min(h, top + step)
+        band = rgb.crop((0, top, w, bottom))
+        fixed = _fix_magenta_band(band, cf)
+        if fixed is not band:
+            rgb.paste(fixed, (0, top))
+    return rgb
 
 
-def _apply_colour_fix(path, gain):
-    """Rewrite a captured JPEG with the magenta correction applied."""
-    if gain <= 0:
+def _apply_colour_fix(path, spec):
+    """Atomically rewrite a captured JPEG with in-place IMX219 colour correction."""
+    cf = _normalize_colour_fix(spec)
+    if not _colour_fix_active(cf):
         return
     if available_mb() < 60:
         with camera_log() as log:
@@ -1763,20 +1981,21 @@ def _apply_colour_fix(path, gain):
         return
     try:
         with Image.open(path) as handle:
-            fixed = _fix_magenta(handle.convert("RGB"), gain)
-        fixed.save(path, quality=95, subsampling=1)
+            rgb = handle.convert("RGB")
+        _fix_magenta(rgb, cf)
+        _atomic_save_image(rgb, path, "JPEG", quality=93, subsampling=1)
+        del rgb
+        reclaim_memory()
     except Exception as exc:
         with camera_log() as log:
             log.write(("FilmBox colour fix skipped: %s\n" % exc).encode())
 
 
-def _wait_for_exposure(picam, timeout=2.5, tol=0.04):
-    """Block until AE/AWB settle after a mode switch.
+def _wait_for_exposure(picam, timeout=1.5, tol=0.05):
+    """Block briefly until AE settles after a sensor mode switch.
 
-    A still capture switches the sensor configuration, which restarts the
-    auto-exposure loop. Grabbing a frame 80 ms later gives a random exposure:
-    backlit scenes came out either 3 stops under or blown out, and the blown
-    ones looked magenta because R and G had clipped while B was still rising.
+    capture_metadata() is already frame-paced by libcamera, so polling without
+    extra sleep() settles in ~3-5 frames (~0.3-0.6 s) instead of 1.5-2.5 s.
     """
     deadline = time.monotonic() + timeout
     prev = None
@@ -1785,6 +2004,8 @@ def _wait_for_exposure(picam, timeout=2.5, tol=0.04):
         try:
             md = picam.capture_metadata()
         except Exception:
+            break
+        if md.get("AeLocked"):
             break
         exp = float(md.get("ExposureTime", 0) or 0)
         gain = float(md.get("AnalogueGain", 0) or 0)
@@ -1798,15 +2019,15 @@ def _wait_for_exposure(picam, timeout=2.5, tol=0.04):
             else:
                 stable = 0
         prev = (exp, gain)
-        time.sleep(0.06)
-    time.sleep(0.05)
 
 
-def filtered_still(original, mode, progress=None, full_res=None):
+def filtered_still(original, mode, progress=None, full_res=None,
+                   colour_fix=COLOUR_FIX_NONE):
     """Render the film copy. LUT work is tiled so an 8MP frame stays in RAM."""
     if mode == "NORMAL":
         return None
     is_lut = mode.startswith(LUT_PREFIX)
+    cf = _normalize_colour_fix(colour_fix)
     cube_file = resolve_lut_path(mode[len(LUT_PREFIX):]) if is_lut else None
     # Measure free RAM *before* decoding: an 8MP RGB copy eats ~24 MB (2MP eats ~6 MB).
     want_full = LUT_FULL_RES if full_res is None else bool(full_res)
@@ -1825,7 +2046,7 @@ def filtered_still(original, mode, progress=None, full_res=None):
             try:
                 prep = _raw_prepare(original, work)
                 if prep is not None:
-                    result = film_copy_raw(*prep, cube_file, progress)
+                    result = film_copy_raw(*prep, cube_file, progress, colour_fix=cf)
                     path = original.with_name(original.stem + "_" +
                                               mode.replace(":", "-").lower() + ".jpg")
                     _atomic_save_image(result, path, "JPEG", quality=93, subsampling=1)
@@ -1854,7 +2075,7 @@ def filtered_still(original, mode, progress=None, full_res=None):
                 image = image.resize((int(image.width * scale), int(image.height * scale)),
                                      Image.Resampling.BOX)
             try:
-                result = film_copy(image, cube_file, progress, gpu_budget)
+                result = film_copy(image, cube_file, progress, gpu_budget, colour_fix=cf)
             except (MemoryError, OSError) as exc:
                 # An 8 MP render needs ~130 MB. Boot-time fragmentation can leave
                 # less than that even though the frame decoded fine, so retry once
@@ -1868,9 +2089,9 @@ def filtered_still(original, mode, progress=None, full_res=None):
                                      Image.Resampling.BOX)
                 del image
                 image = small
-                result = film_copy(image, cube_file, progress, gpu_budget)
+                result = film_copy(image, cube_file, progress, gpu_budget, colour_fix=cf)
         else:
-            result = filter_image(image, mode)
+            result = filter_image(image, mode, colour_fix=cf)
     if is_lut:
         tag = "" if max(result.size) > max(LUT_SAVE_MAX) else "_%dmp" % round(
             result.width * result.height / 1e6)
@@ -1892,9 +2113,14 @@ def capture_still(resolution=(3280, 2464), sound=True, rotation=180):
     click(sound)
     w, h = resolution
     try:
-        run_command(["rpicam-still", "-n", "-t", "1300", "--width", str(w),
-                     "--height", str(h), "--mode", FULL_STILL_MODE,
-                     "--rotation", str(rotation), "-o", str(output)], timeout=35)
+        tuning_path = resolve_tuning_file()
+        cmd = ["rpicam-still", "-n", "-t", "1300", "--width", str(w),
+               "--height", str(h), "--mode", FULL_STILL_MODE,
+               "--rotation", str(rotation)]
+        if tuning_path is not None:
+            cmd.extend(["--tuning-file", str(tuning_path)])
+        cmd.extend(["-o", str(output)])
+        run_command(cmd, timeout=35)
         with Image.open(output) as im:
             im.verify()
     except Exception:
@@ -1904,9 +2130,16 @@ def capture_still(resolution=(3280, 2464), sound=True, rotation=180):
     return output
 
 
-def take_photo(mode="NORMAL", resolution=(3280, 2464), sound=True, rotation=180, full_res=None):
+def take_photo(mode="NORMAL", resolution=(3280, 2464), sound=True, rotation=180,
+               full_res=None, colour_fix=COLOUR_FIX_NONE):
     output = capture_still(resolution, sound, rotation)
-    filtered = filtered_still(output, mode, full_res=full_res) if mode != "NORMAL" else None
+    cf = _normalize_colour_fix(colour_fix)
+    if mode != "NORMAL":
+        filtered = filtered_still(output, mode, full_res=full_res, colour_fix=cf)
+    else:
+        if _colour_fix_active(cf):
+            _apply_colour_fix(output, cf)
+        filtered = None
     return output, filtered
 
 
@@ -1960,7 +2193,8 @@ class CameraStream:
             from picamera2 import Picamera2
             self.error = None
             transform = self._transform()
-            picam = Picamera2()
+            tuning = _load_picam_tuning(Picamera2)
+            picam = Picamera2(tuning=tuning) if tuning is not None else Picamera2()
             try:
                 self._build_configs(picam, transform)
                 picam.configure(self.video_config)
@@ -2521,6 +2755,8 @@ class TimelapseCapture:
             span = 1.0 / self.zoom
             off = (1.0 - span) * 0.5
             roi_args = ["--roi", f"{off:.4f},{off:.4f},{span:.4f},{span:.4f}"]
+        tuning_path = resolve_tuning_file()
+        tuning_args = ["--tuning-file", str(tuning_path)] if tuning_path is not None else []
         # Scheduling accounts for capture duration so intervals stay accurate without overlapping.
         while not self.stop_event.is_set() and (count is None or n < count):
             frame_started = time.monotonic()
@@ -2528,7 +2764,7 @@ class TimelapseCapture:
             w,h = self.resolution
             command = ["rpicam-still", "-n", "-t", "950", "--mode", FULL_STILL_MODE,
                        "--width", str(w), "--height", str(h),
-                       "--rotation", str(self.rotation)] + roi_args + ["-o", str(path)]
+                       "--rotation", str(self.rotation)] + tuning_args + roi_args + ["-o", str(path)]
             run_command(command, timeout=35)
             if path.stat().st_size < 1024:
                 raise RuntimeError("Timelapse frame is empty: " + str(path))
@@ -3767,32 +4003,38 @@ class FilmBoxUI:
         self.status = value
         self.status_deadline = time.monotonic() + delay
 
-    def _colour_gain(self):
-        gains = (0.0, 0.18, 0.28, 0.36)
-        try:
-            idx = int(self.settings.get("colour_fix", 2) or 0)
-        except Exception:
-            idx = 2
-        return gains[max(0, min(3, idx))]
+    def _colour_fix(self):
+        return colour_fix_spec(self.settings)
+
+    def colour_fix_job(self, original, spec):
+        """Apply IMX219 colour fix to a NORMAL photo in the background without freezing UI."""
+        cf = _normalize_colour_fix(spec)
+        if not _colour_fix_active(cf) or self.film_busy:
+            return
+        self.film_busy = True
+
+        def work():
+            try:
+                _apply_colour_fix(original, cf)
+            finally:
+                self.film_busy = False
+
+        self.film_worker = threading.Thread(target=work, daemon=True)
+        self.film_worker.start()
 
     def film_job(self, original, look):
         """Render the filter copy in its own thread, serialized to protect RAM and camera state."""
         if self.film_busy:
             self.set_status("FILM BUSY - ONE AT A TIME", 4)
             return
-        gain = self._colour_gain()
-        if gain > 0:
-            try:
-                _apply_colour_fix(original, gain)
-            except Exception:
-                pass
+        cf = self._colour_fix()
         self.film_busy = True
         if not look.startswith(LUT_PREFIX):
             # Built-in filters run at bounded resolution: no need to freeze the viewfinder,
             # while still serializing with film_busy so rapid bursts cannot OOM 512 MB RAM.
             def quick():
                 try:
-                    filtered_still(original, look)
+                    filtered_still(original, look, colour_fix=cf)
                     self.set_status("SAVED +FILTER", 4)
                 except Exception as exc:
                     with camera_log() as log:
@@ -3843,12 +4085,13 @@ class FilmBoxUI:
                         full_res=full_res,
                         progress=on_progress,
                         on_status=on_note,
+                        colour_fix=cf,
                     )
                     if output_path is not None:
                         on_progress(100)
                 if output_path is None:
                     output_path = filtered_still(original, look, progress=on_progress,
-                                                 full_res=full_res)
+                                                 full_res=full_res, colour_fix=cf)
                 output_name = output_path.name if output_path is not None else ""
                 try:
                     with Image.open(original.with_name(output_name)) as probe:
@@ -3887,6 +4130,10 @@ class FilmBoxUI:
             look = self.settings["filter"]
             if look != "NORMAL":
                 self.film_job(original, look)
+            else:
+                cf = self._colour_fix()
+                if _colour_fix_active(cf):
+                    self.colour_fix_job(original, cf)
         self.job(operation, "CAPTURING...")
 
     def do_gif(self):
@@ -4066,6 +4313,12 @@ class FilmBoxUI:
             pw = max(64, self.display.w - 168)
             ph = max(64, self.display.h - 20)
             frame = fill_size(self.preview, (pw, ph))
+            cf = self._colour_fix()
+            if _colour_fix_active(cf) and self.mode == "PHOTO":
+                try:
+                    frame = _fix_magenta_band(frame, cf)
+                except Exception:
+                    pass
         self.picker = LookPicker(self.settings["filter"], frame)
         if target_lut and not self.picker.jump_lut():
             self.picker = None
@@ -4382,6 +4635,7 @@ class FilmBoxUI:
                          self.settings["resolution"], self.settings["video"],
                          self.settings["timelapse_interval"], self.settings["sound"],
                          self.settings.get("clean_ui", False), self.settings.get("zoom", 1.0),
+                         self.settings.get("colour_fix", 2),
                          len(self.stopmotion.frames) if self.stopmotion else 0)
                 if not new_frame and state == last_status and now - last_draw < (0.5 if self.recording else 1.0):
                     time.sleep(0.012)
@@ -4395,6 +4649,12 @@ class FilmBoxUI:
                     scene = fill_size(self.preview, (self.display.w, self.display.h))
                     if mode == "STOPMOTION" and self.stopmotion is not None:
                         scene = self.stopmotion.onion_skin(scene)
+                    cf = self._colour_fix()
+                    if _colour_fix_active(cf) and mode == "PHOTO":
+                        try:
+                            scene = _fix_magenta_band(scene, cf)
+                        except Exception:
+                            pass
                     if style != "NORMAL" and mode != "VIDEO":
                         try:
                             scene = filter_image(scene, style, preview=True)
@@ -4464,7 +4724,11 @@ def command_diagnose():
         print("picamera2: MISSING - sudo apt install python3-picamera2")
     print("numpy acceleration:", "available" if np is not None else "unavailable")
     print("film-copy engine:", _ACCEL, "|", _accel_status())
-    print("settings:", load_settings())
+    settings = load_settings()
+    tuning_path = resolve_tuning_file()
+    print("isp tuning:", str(tuning_path) if tuning_path is not None else "system default (vc4/imx219.json)")
+    print("colour fix:", settings.get("colour_fix", 2), colour_fix_spec(settings))
+    print("settings:", settings)
     print("full-field camera mode (preview/video):", FULL_FOV_MODE)
     print("video presets:", VIDEO_LABELS)
     print("output:", ROOT)
@@ -4505,6 +4769,8 @@ def main(argv=None):
                         help="Photo, GIF and video orientation (0 or 180)")
     parser.add_argument("--lut-full", choices=["on", "off"], default=None,
                         help="Film copy at full 8MP (on, default) or 2MP (off)")
+    parser.add_argument("--colour-fix", type=int, choices=(0, 1, 2, 3), default=None,
+                        help="Magenta sky correction level 0=off..3=high (default 2)")
     parser.add_argument("--preview-fps", type=int, choices=(12, 15, 20, 24, 25, 30), default=None,
                         help="Set preview target FPS with the config command")
     parser.add_argument("--video-quality", choices=("wide", "720p", "1080p", "480p"), default="wide")
@@ -4523,8 +4789,10 @@ def main(argv=None):
                 settings["preview_fps"] = args.preview_fps
             if args.lut_full is not None:
                 settings["lut_full_res"] = args.lut_full == "on"
+            if args.colour_fix is not None:
+                settings["colour_fix"] = args.colour_fix
             if (args.rotation is not None or args.preview_fps is not None
-                    or args.lut_full is not None):
+                    or args.lut_full is not None or args.colour_fix is not None):
                 save_settings(settings)
             print(json.dumps(settings, indent=2))
             return 0
@@ -4548,7 +4816,11 @@ def main(argv=None):
                     pass
             dims = tuple(map(int, args.resolution.split("x")))
             full_res = settings.get("lut_full_res", True) if args.lut_full is None else (args.lut_full == "on")
-            original, filtered = take_photo(args.filter, dims, not args.no_sound, rotation, full_res=full_res)
+            cf_idx = settings.get("colour_fix", 2) if args.colour_fix is None else args.colour_fix
+            original, filtered = take_photo(
+                args.filter, dims, not args.no_sound, rotation,
+                full_res=full_res, colour_fix=COLOUR_FIX_PRESETS[cf_idx],
+            )
             print("Original:", original)
             if filtered:
                 print("Filtered:", filtered)

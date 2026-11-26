@@ -63,6 +63,8 @@ Cardputer Zero（CM0 / RP3A0）上的 Mesa `vc4` 驱动限制极严，改 `GpuFi
 
 - **黑白胶片严禁叠暖橙色光晕**：`fuji_acros`、`fuji_acros_red`、`ilford_hp5_400` 是纯单色黑白 LUT（RGB 通道差为 0）。`build_glow()` / `add_halation()` 对单色 LUT 必须使用中性银盐白光晕 `(mask, mask, mask)`，只有彩色胶片才用暖橙红光晕 `(1.0, 0.72, 0.42)`。
 - **光晕必须在套用 LUT 之后计算**：无论全图、GPU 缩略图还是 `film_copy_raw` 流式路径，都必须先对 1/4 缩略图过一遍 LUT 再调 `build_glow()`。
+- **偏色修正必须融合在渲染管线内，禁止在 `film_job()` 同步覆写 8MP 原图**：LUT 胶片路径直接通过着色器 `uniform vec4 colourFix;`（`glUniform4f`）或 CPU 分带 256 字节通道查表 + 定点提绿执行；`NORMAL` 模式通过后台 `colour_fix_job()` + `_atomic_save_image()` 异步原子落盘，不冻结取景器。
+- **自定义 `imx219.json` 仅限 VC4 格式且必须安全回退**：通过 `resolve_tuning_file()` / `_load_picam_tuning()` 加载（支持 `FILMBOX_TUNING_FILE`、`LIBCAMERA_RPI_TUNING_FILE`、`~/.config/filmbox/imx219.json`、`/usr/share/filmbox/imx219.json`），文件缺失或 JSON 损坏时必须静默记日志并回退系统默认，严禁让坏调优文件阻塞拍照。
 
 ---
 
