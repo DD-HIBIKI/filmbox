@@ -194,13 +194,14 @@ def timestamp():
 
 
 COLOUR_FIX_NONE = (1.0, 1.0, 1.0, 0.0)
-# (r_mul, g_mul, b_mul, sky_lift): neutralizes IMX219 global red/magenta cast
-# (weak IR-cut + AWB bias) plus residual blue-sky violet lift.
+# (r_mul, g_mul, b_mul, sky_lift): sky-only green lift where B > G.
+# Keep global r/g/b multipliers at 1.0 so neutral white walls, skin and foliage
+# (where B <= G) are guaranteed 0/255 untouched (see docs/reports/2026-11-26-colour-fix-test.md).
 COLOUR_FIX_PRESETS = (
     (1.00, 1.00, 1.00, 0.00),  # 0: OFF
-    (0.95, 1.03, 1.00, 0.09),  # 1: LOW  (gentle; safest for warm indoor skin)
-    (0.91, 1.05, 1.00, 0.14),  # 2: MED  (default; best match vs iPhone 15 Pro)
-    (0.87, 1.07, 1.00, 0.19),  # 3: HIGH (strong daylight / heavy IR leakage)
+    (1.00, 1.00, 1.00, 0.12),  # 1: LOW
+    (1.00, 1.00, 1.00, 0.20),  # 2: MED (default; sky-only B>G lift)
+    (1.00, 1.00, 1.00, 0.28),  # 3: HIGH (stronger sky-only B>G lift)
 )
 
 
@@ -1951,9 +1952,9 @@ def _fix_magenta_band(band, spec=COLOUR_FIX_PRESETS[2]):
 def _fix_magenta(image, spec=COLOUR_FIX_PRESETS[2], step=256):
     """Apply IMX219 colour correction in-place, 256 rows at a time (~3 MB temp RAM).
 
-    Compensates the IMX219 module's global red/magenta cast (weak IR-cut + AWB
-    bias) via 256-byte per-channel LUTs and lifts residual blue-sky violet cast
-    where B > G.
+    Built-in presets keep (r, g, b) = (1, 1, 1) and lift green only where B > G
+    so neutral white walls, skin and foliage remain 0/255 untouched; custom
+    4-tuples (r_mul, g_mul, b_mul, sky_lift) are also supported via 256-byte LUTs.
     """
     cf = _normalize_colour_fix(spec)
     if not _colour_fix_active(cf):

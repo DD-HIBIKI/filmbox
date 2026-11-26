@@ -4,35 +4,35 @@
 
 ---
 
-## 一、偏色现象与成因（对比 iPhone 15 Pro）
+## 一、偏色现象与成因（对比 iPhone 15 Pro + 真机室内实测）
 
-同场景实拍对照见 [`comparisons/colour_comparison.jpg`](comparisons/colour_comparison.jpg)（说明见 [`comparisons/README.md`](comparisons/README.md)）。对 3 组场景 9 个同名区域逐像素分析后，IMX219 模组相对 iPhone 15 Pro 的主要差异有两点：
+同场景室外对照见 [`comparisons/colour_comparison.jpg`](comparisons/colour_comparison.jpg)，真机室内测试报告见 [`reports/2026-11-26-colour-fix-test.md`](reports/2026-11-26-colour-fix-test.md)（配图 [`reports/indoor-before-after.jpg`](reports/indoor-before-after.jpg)）。结合设备原版 [`tuning/imx219-vc4.json`](tuning/imx219-vc4.json) 的 `rpi.ccm` 分析，原因如下：
 
-1. **全画面红通道偏高（+7%～13%）、绿通道偏低（-3%～13%）**
-   - 蓝天原本呈明显薰衣草紫（例如 `151/140/213`，色相 `249°`，而 iPhone 为 `130/160/215`，色相 `219°`）。
-   - 中性灰地砖、白墙、云层与沥青路面也普遍泛粉红/品红（`R/G` 达到 `1.14–1.22`，iPhone 为 `0.96–1.03`）。
-2. **逆光绿叶偏红褐色（硬件 IR-cut 偏弱 / 近红外漏光）**
-   - 植物叶绿素在 700–900 nm 强烈反射近红外光并主要渗入红通道，导致第 3 组逆光树叶呈红褐（`50/33/38`）而非深绿（`36/44/41`）。仅靠软件后处理无法 100% 复原，但压低全局红通道可显著减轻。
+1. **室内白平衡本身准确，不能施加全局红绿乘数**
+   - 室内白墙实测原始值 `113/114/111`（三通道差 <= 3）；全局 `r_mul=0.91 / g_mul=1.05` 会把白墙拉成 `102/119/111`（明显泛绿）。
+2. **蓝天发紫的核心诱因在 `imx219-vc4.json` 的高色温 `rpi.ccm` 矩阵**
+   - 室内段（`2860–4650 K`）的 `G_row` 蓝通道负串扰在 `-0.83 .. -1.06`；但到了 `7580 K`（蓝天/开阔阴影）骤增至 **`-1.50047`**（对角 `+3.07922`，行和仍为 `1.00000`）。
+   - 行和 `1.00000` 使中性白墙不受影响，但蓝天（`B > G`）的绿通道被显著压低，表现为 `R ≈ G < B` 偏紫。
+3. **逆光绿叶偏红褐（弱 IR-cut 近红外漏光）**
+   - 叶绿素反射 700–900 nm 近红外光渗入红通道，属模组光学特性，无法靠全局压红在不破坏室内的前提下完全消除。
 
 ---
 
-## 二、软件层修正模型（`colour_fix` 0..3，默认已开启）
+## 二、软件层修正模型（`colour_fix` 0..3，仅作用于 `B > G` 蓝区）
 
-早期版本仅在 `B > G` 区域提绿（`G += (B-G) * k`），只能修正蓝天误差的约一半，且完全无法改善地砖/白墙/云层的粉红底色；同时在 `film_job()` 中同步覆写 8MP 原图导致额外 2.5–3 s 卡顿与 ~72 MB 内存峰值。
+为了同时保证**室内白墙/肤色/绿叶 0 改动**且修正蓝天发紫，所有内置档位保持全局 `(R, G, B) = (1.00, 1.00, 1.00)`，仅对 `B > G` 的蓝区像素按 `G += (B - G) * sky_lift` 提绿：
 
-当前版本已升级为 **4 参数模型 `(r_mul, g_mul, b_mul, sky_lift)`** 并融合进渲染管线：
+| 档位 (`colour_fix`) | 参数 `(R, G, B, sky_lift)` | 室内白墙 `113/114/111` 变化 | 适用场景 |
+|---:|---|---:|---|
+| `0` (OFF) | `(1.00, 1.00, 1.00, 0.00)` | `0 / 0 / 0` | 关闭（启用自定义 `imx219.json` 时推荐） |
+| `1` (LOW) | `(1.00, 1.00, 1.00, 0.12)` | `0 / 0 / 0` | 轻度蓝天提绿 |
+| `2` (MED，默认) | `(1.00, 1.00, 1.00, 0.20)` | `0 / 0 / 0` | 日常平衡档（中性色严格不变） |
+| `3` (HIGH) | `(1.00, 1.00, 1.00, 0.28)` | `0 / 0 / 0` | 强蓝天去紫（等同旧版 0.28 强度） |
 
-| 档位 (`colour_fix`) | 参数 `(R, G, B, sky_lift)` | 9 区平均色度误差（vs iPhone） | 蓝天色度误差 | 适用场景 |
-|---:|---|---:|---:|---|
-| `0` (OFF) | `(1.00, 1.00, 1.00, 0.00)` | 7.00% | 5.76% | 关闭（启用硬件 `imx219.json` 时推荐） |
-| `1` (LOW) | `(0.95, 1.03, 1.00, 0.09)` | 5.07% | 3.32% | 室内暖光 / 人像保守档 |
-| `2` (MED，默认) | `(0.91, 1.05, 1.00, 0.14)` | **4.01%** | **1.73%** | 室外日常综合最优 |
-| `3` (HIGH) | `(0.87, 1.07, 1.00, 0.19)` | **3.46%** | **0.57%** | 强日光 / 重度近红外偏红场景 |
-
-### 管线与性能特点
+### 管线与性能特点（已在 Cardputer Zero 真机验证）
 - **LUT 胶片路径（GPU）**：在 GLES2 片元着色器 `FS` 中通过 `uniform vec4 colourFix;` 无分支执行，紧接 3D LUT 采样前完成——**0 ms 额外耗时、0 额外内存、单次 JPEG 解码**，不改动原片。
-- **CPU / 缩略图 / 取景器路径**：使用 256 字节缓存通道查表 + 掩码 `uint16` 定点提绿，256 行分带原地写回；`320×170` 实时取景仅约 `0.39 ms/帧`。
-- **`NORMAL` 模式**：通过 `colour_fix_job()` 在后台线程以原子写盘（`_atomic_save_image`）静默修正，**不冻结取景器**。
+- **CPU / 缩略图 / 取景器路径**：256 行分带原地写回（8MP 峰值 RSS 增量仅 **+23 MB**），内置档位跳过全图乘表、仅扫描 `B > G` 掩码，非蓝条带零拷贝直接跳过；`PHOTO` 模式取景器与 `LookPicker` 在调用 `filter_image(..., preview=True)` 之前已先执行 `_fix_magenta_band`，实现所见即所得且不会双重叠加。
+- **`NORMAL` 模式**：通过 `colour_fix_job()` 在后台 daemon 线程以原子写盘（`_atomic_save_image`）静默修正，共享 `film_busy` 且低于 60 MB 剩余内存自动跳过，**不冻结取景器**。
 - **黑白 LUT 保护**：`fuji_acros` / `ilford_hp5_400` 等黑白胶片在修正后仍经单色 LUT 与中性银盐白光晕，输出严格单色。
 
 ### 命令行调整档位
@@ -75,21 +75,20 @@ FilmBox 已在 `CameraStream`（`Picamera2` 预览/拍照/录像）、`capture_s
 - **官方相机标定工具（CTT）**：
   - `raspberrypi/libcamera` 中的 `utils/raspberrypi/ctt/`，使用灰卡 + 24 色卡 DNG 可标定出该模组专属的 `rpi.alsc`、`rpi.awb`、`rpi.ccm`。
 
-### 3. 真机实测与部署步骤
+### 3. 真机实测候选文件与部署步骤
+
+仓库已基于真机原版 [`tuning/imx219-vc4.json`](tuning/imx219-vc4.json) 生成一份仅微调日光/蓝天段 `rpi.ccm`（室内 `2860–4650 K` 字节级不变、每行和严格保持 `1.00000`）的候选文件：[`tuning/imx219-vc4-skyfix.json`](tuning/imx219-vc4-skyfix.json)。
+
 ```bash
-# 1) 查看设备自带的 imx219 调优文件
-ls -la /usr/share/libcamera/ipa/rpi/vc4/imx219*.json
-
-# 2) 先测官方 NoIR 文件（务必关掉软件修正 --colour-fix 0，避免双重校正）
-#    - 若蓝天/树叶恢复自然 → 模组属于弱/无 IR-cut，可直接使用或微调 imx219_noir.json
-#    - 若整张画面明显偏绿 → 模组带 IR-cut，应基于标准 imx219.json 微调 rpi.awb / rpi.ccm
-FILMBOX_TUNING_FILE=/usr/share/libcamera/ipa/rpi/vc4/imx219_noir.json \
-  filmbox photo --colour-fix 0
-
-# 3) 放置专属调优文件使其长期生效（同时作用于拍照、实时预览、录像与延时）
+# 1) 测试仓库内置的蓝天 CCM 候选调优文件（关闭软件修正 --colour-fix 0，避免双重补偿）
 mkdir -p ~/.config/filmbox
-cp /usr/share/libcamera/ipa/rpi/vc4/imx219.json ~/.config/filmbox/imx219.json
-# 编辑 ~/.config/filmbox/imx219.json 中的 rpi.awb / rpi.ccm / rpi.alsc 后：
-filmbox diagnose                # 确认 isp tuning 显示为 ~/.config/filmbox/imx219.json
-filmbox config --colour-fix 0   # 硬件 ISP 已校准时关闭软件修正，避免重复补偿
+cp docs/tuning/imx219-vc4-skyfix.json ~/.config/filmbox/imx219.json
+filmbox diagnose                      # 确认 isp tuning 显示为 ~/.config/filmbox/imx219.json
+filmbox photo --colour-fix 0          # 室外蓝天 + 室内白墙各拍一张对照
+
+# 2) 若效果满意，持久化关闭软件修正，让硬件 ISP 零开销同时生效于拍照/预览/录像/延时：
+filmbox config --colour-fix 0
+
+# 3) 临时切回系统默认做 A/B 对照（无需删除文件）：
+FILMBOX_TUNING_FILE=0 filmbox photo --colour-fix 0
 ```
