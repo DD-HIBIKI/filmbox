@@ -238,6 +238,25 @@ def _proc_rss_mb():
     return None
 
 
+def _proc_mem_str():
+    """Return 'rss=XXMB(anon=YYMB)' separating private dirty RAM from shared Mesa libs."""
+    rss = anon = None
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) // 1024
+                elif line.startswith("RssAnon:"):
+                    anon = int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    if rss is None:
+        return "rss=n/a"
+    if anon is not None:
+        return f"rss={rss}MB(anon={anon}MB)"
+    return f"rss={rss}MB"
+
+
 def timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
@@ -494,9 +513,8 @@ GRAY_PALETTE = _palette(GRAY_COLORS)
 _LUT_CACHE = {}
 _LUT_MONO = {}
 _LUT_CACHE_MAX = 2
-CMA_HARD_MIN_8MP_MB = 26
-CMA_SOFT_8MP_MB = 45
-CMA_RELEASE_GPU_MB = 60
+MEM_PRESSURE_AVAIL_MB = 100
+CMA_PRESSURE_MB = 20
 _HELD_HELPERS = []
 
 
@@ -1565,9 +1583,8 @@ def _accel_status():
 
 GRAIN_STRENGTH = 5.0
 GPU_MAX_PIXELS = 8_500_000
-GPU_MIN_FREE_MB = 30
+GPU_MIN_FREE_MB = 25
 GPU_FULL_RES_MIN_MB = 60
-GPU_FULL_RES_MIN_CMA_MB = 10
 CPU_FULL_RES_MIN_MB = 85
 _ACCEL = os.environ.get("FILMBOX_ACCEL", "auto").strip().lower()
 _ACCEL_LOCK = threading.Lock()
@@ -1746,17 +1763,25 @@ def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=Non
     cf = _normalize_colour_fix(colour_fix)
     avail = available_mb()
     cma = cma_free_mb()
-    # In-place GPU render allocates ~28-35 MB RAM + ~3 MB CMA on top of the
-    # already-resident slim worker (~35 MB), so 60 MB Available / 10 MB CMA is
-    # plenty for full 8MP (old 130 MB wall belonged to multi-buffer CPU paths).
-    room_for_full = avail >= GPU_FULL_RES_MIN_MB and (cma is None or cma >= GPU_FULL_RES_MIN_CMA_MB)
+    # Gate 8MP on MemAvailable (not CmaFree alone!): right after cold boot Linux
+    # parks movable page cache inside the CMA region so CmaFree can read 1-10 MB
+    # while MemAvailable is 120-170 MB and CMA allocations migrate cache cleanly.
+    room_for_full = avail >= GPU_FULL_RES_MIN_MB
     decode_mb = 24 if (want_full and room_for_full) else 6
     gpu_budget = avail - decode_mb
-    if gpu_budget < GPU_MIN_FREE_MB or (cma is not None and cma < 8):
-        log_event("GPU", f"skip low_mem mode={mode} avail={avail}MB cma={cma}MB budget={gpu_budget}MB | {mem_snapshot()}")
-        return None, f"low_mem(avail={avail}MB,cma={cma}MB)"
+    if gpu_budget < GPU_MIN_FREE_MB:
+        log_event(
+            "GPU",
+            f"skip reason=budget mode={mode} avail={avail}MB decode={decode_mb}MB "
+            f"budget={gpu_budget}MB<{GPU_MIN_FREE_MB}MB cma={cma}MB | {mem_snapshot()}"
+        )
+        return None, f"low_mem(budget={gpu_budget}MB)"
     if want_full and not room_for_full:
-        log_event("GPU", f"2mp_guard mode={mode} avail={avail}MB<{GPU_FULL_RES_MIN_MB}MB or cma={cma}MB<{GPU_FULL_RES_MIN_CMA_MB}MB | {mem_snapshot()}")
+        log_event(
+            "GPU",
+            f"2mp_guard reason=avail mode={mode} avail={avail}MB<{GPU_FULL_RES_MIN_MB}MB "
+            f"cma={cma}MB | {mem_snapshot()}"
+        )
     t_dec0 = time.monotonic()
     with Image.open(original) as handle:
         if not (want_full and room_for_full):
@@ -1781,7 +1806,7 @@ def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=Non
                            progress=progress, colour_fix=cf)
     except (MemoryError, OSError) as exc:
         oom_fallback = True
-        log_event("GPU", f"8mp_oom_fallback err={exc} -> retrying 2MP | {mem_snapshot()}")
+        log_event("GPU", f"8mp_oom_fallback reason={type(exc).__name__} err={exc} -> retrying 2MP | {mem_snapshot()}")
         scale = min(LUT_SAVE_MAX[0] / image.width, LUT_SAVE_MAX[1] / image.height)
         small = image.resize((max(1, int(image.width * scale)),
                               max(1, int(image.height * scale))),
@@ -1803,17 +1828,16 @@ def _render_lut_with_gpu(gpu, original, mode, cube_path, want_full, progress=Non
     del image, result
     reclaim_memory()
     t_tot = time.monotonic() - t_start
-    rss = _proc_rss_mb()
     log_event(
         "GPU",
         f"render ok {out_path.name} {rw}x{rh} {size_kb}KB "
         f"(total={t_tot:.2f}s dec={t_dec:.2f}s gpu={t_gpu:.2f}s save={t_sav:.2f}s"
-        f"{' oom_2mp' if oom_fallback else ''} rss={rss}MB) | {mem_snapshot()}"
+        f"{' oom_2mp' if oom_fallback else ''} {_proc_mem_str()}) | {mem_snapshot()}"
     )
     return out_path, None
 
 
-GPU_WORKER_IDLE_SEC = 30.0
+GPU_WORKER_IDLE_SEC = 300.0
 
 
 def _set_parent_death_signal():
@@ -1869,7 +1893,7 @@ def command_gpu_worker():
         "renderer": gpu.renderer,
         "maxt": gpu.maxt,
         "pid": os.getpid(),
-        "rss_mb": _proc_rss_mb(),
+        "mem": _proc_mem_str(),
         "init_s": round(time.monotonic() - t_init0, 2),
     })
 
@@ -1928,7 +1952,7 @@ def command_gpu_worker():
 
 
 class GpuWorker:
-    """Lazy, idle-exiting controller for the `_gpu-worker` helper process."""
+    """Persistent-spawner, idle-exiting controller for the `_gpu-worker` helper process."""
 
     def __init__(self, script_path=None):
         self.script_path = str(script_path or Path(__file__).resolve())
@@ -1944,18 +1968,36 @@ class GpuWorker:
         self._job_lock = threading.Lock()
         self._progress_cb = None
         self._job_result = None
+        self._spawn_q = queue.Queue()
+        self._spawner = None
 
-    def start(self):
+    def _ensure_spawner(self):
+        # Linux PR_SET_PDEATHSIG delivers SIGTERM when the *spawning thread* exits,
+        # not only when the whole process exits! Spawning from one long-lived daemon
+        # thread ensures `_gpu-worker` stays alive across short-lived `render()` threads
+        # while still dying automatically if FilmBox itself exits or gets SIGKILL'd.
+        if self._spawner is None or not self._spawner.is_alive():
+            self._spawner = threading.Thread(target=self._spawn_loop, daemon=True)
+            self._spawner.start()
+
+    def _spawn_loop(self):
+        while True:
+            done_evt = self._spawn_q.get()
+            if done_evt is None:
+                break
+            try:
+                self._do_spawn()
+            finally:
+                done_evt.set()
+
+    def _do_spawn(self):
         with self._cond:
-            if self.state in ("warming", "ready", "stopped", "failed"):
+            if self.state != "warming":
                 return
-            self.state = "warming"
-            self.error = None
-            self._spawn_t0 = time.monotonic()
         log_fh = None
         try:
             log_fh = camera_log()
-            self.proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 [sys.executable, "-u", self.script_path, "_gpu-worker"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -1963,7 +2005,17 @@ class GpuWorker:
                 text=True,
                 bufsize=1,
             )
-            log_event("GPU", f"worker spawned pid={self.proc.pid} | {mem_snapshot()}")
+            with self._cond:
+                if self.state != "warming":
+                    # stop() was called while Popen was in flight
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                    return
+                self.proc = proc
+            log_event("GPU", f"worker spawned pid={proc.pid} | {mem_snapshot()}")
         except Exception as exc:
             with self._cond:
                 self.state = "failed"
@@ -1979,6 +2031,18 @@ class GpuWorker:
                     pass
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
+
+    def start(self):
+        with self._cond:
+            if self.state in ("warming", "ready", "stopped", "failed"):
+                return
+            self.state = "warming"
+            self.error = None
+            self._spawn_t0 = time.monotonic()
+            self._ensure_spawner()
+        done_evt = threading.Event()
+        self._spawn_q.put(done_evt)
+        done_evt.wait(timeout=5.0)
 
     def is_warming(self):
         with self._cond:
@@ -2025,7 +2089,7 @@ class GpuWorker:
                             "GPU",
                             f"worker ready pid={msg.get('pid', getattr(proc, 'pid', 0))} "
                             f"renderer='{self.renderer}' maxt={self.maxt} "
-                            f"rss={msg.get('rss_mb')}MB spawn={dt:.2f}s | {mem_snapshot()}"
+                            f"{msg.get('mem', 'rss=n/a')} spawn={dt:.2f}s | {mem_snapshot()}"
                         )
                     elif ev == "idle_exit":
                         idle_exited = True
@@ -2196,6 +2260,12 @@ class GpuWorker:
 
     def stop(self):
         self._shutdown(next_state="stopped")
+        spawner = self._spawner
+        self._spawner = None
+        if spawner is not None and spawner.is_alive():
+            self._spawn_q.put(None)
+            if spawner is not threading.current_thread():
+                spawner.join(timeout=1.5)
 
     def _shutdown(self, next_state="stopped"):
         with self._cond:
@@ -2771,28 +2841,22 @@ class CameraStream:
             cropped = cropped.resize(target, Image.Resampling.LANCZOS)
         _atomic_save_image(cropped, path, "JPEG", quality=93, subsampling=1)
 
-    def capture_still(self, path, resolution=None):
+    def capture_still(self, path, resolution=None, on_enomem=None):
+        """Capture a still (8MP-first), returning (width, height, degraded).
+
+        Never skips 8MP upfront just because CmaFree is low: after cold boot Linux
+        parks movable page cache inside the CMA region and migrates it out on demand.
+        Only steps down to 2x2 binned 2MP if full 8MP genuinely hits ENOMEM twice.
+        """
         limit = resolution or SENSOR_SIZE
         want_8mp = limit[0] * limit[1] > 2_500_000
-        cma = cma_free_mb() if want_8mp else None
-        # Only skip attempting 8MP upfront if CMA is critically below physical minimum
-        # (< 26 MB); between 26-45 MB, reclaim and try 8MP first (picam.stop() frees
-        # preview CMA right before still allocation).
-        if want_8mp and cma is not None and cma < CMA_SOFT_8MP_MB:
-            _drop_page_cache()
-            reclaim_memory()
-            cma = cma_free_mb()
-        hard_low_cma = cma is not None and cma < CMA_HARD_MIN_8MP_MB
-        if hard_low_cma:
-            log_event("CAPTURE", f"hard_low_cma CmaFree={cma}MB<{CMA_HARD_MIN_8MP_MB}MB -> 2MP | {mem_snapshot()}")
-        # Bursts of 8 MP shots can outrun the CMA pool: a capture then fails with
-        # ENOMEM. Reclaim and retry 8MP once, then fall back to 2x2 binned 2MP only
-        # as a last resort so capture never crashes.
         last = None
         for attempt in range(4):
-            use_2mp = hard_low_cma or attempt >= 2
+            use_2mp = want_8mp and attempt >= 2
             sensor_mode = (1640, 1232) if use_2mp else SENSOR_SIZE
             eff_limit = (min(limit[0], 1640), min(limit[1], 1232)) if use_2mp else limit
+            if use_2mp and attempt == 2:
+                log_event("CAPTURE", f"2mp_fallback reason=enomem_2x | {mem_snapshot()}")
             t0 = time.monotonic()
             try:
                 ae_s = self._capture_once(path, eff_limit, sensor_mode)
@@ -2802,12 +2866,14 @@ class CameraStream:
                     kb = Path(path).stat().st_size // 1024
                 except Exception:
                     pw, ph, kb = eff_limit[0], eff_limit[1], 0
+                degraded = want_8mp and (pw * ph < 2_500_000)
                 log_event(
                     "CAPTURE",
                     f"ok {Path(path).name} {pw}x{ph} {kb}KB sensor={sensor_mode[0]}x{sensor_mode[1]} "
-                    f"try={attempt + 1} ({time.monotonic() - t0:.2f}s ae={ae_s:.2f}s) | {mem_snapshot()}"
+                    f"try={attempt + 1}{' degraded=2MP' if degraded else ''} "
+                    f"({time.monotonic() - t0:.2f}s ae={ae_s:.2f}s) | {mem_snapshot()}"
                 )
-                return
+                return pw, ph, degraded
             except OSError as exc:
                 last = exc
                 if getattr(exc, "errno", None) != 12:
@@ -2815,9 +2881,14 @@ class CameraStream:
                     raise
                 log_event("CAPTURE", f"ENOMEM try={attempt + 1} sensor={sensor_mode[0]}x{sensor_mode[1]} | {mem_snapshot()}")
                 self._restore_preview()
+                if on_enomem is not None:
+                    try:
+                        on_enomem()
+                    except Exception:
+                        pass
                 _drop_page_cache()
                 reclaim_memory()
-                time.sleep(0.5 + 0.3 * attempt)
+                time.sleep(0.8 + 0.4 * attempt)
         raise last
 
     def _capture_once(self, path, limit, sensor_size=SENSOR_SIZE):
@@ -4534,12 +4605,17 @@ class FilmBoxUI:
                 except Exception:
                     pixels = 0
                 size_tag = ("%dMP" % round(pixels / 1e6)) if pixels else "FILM"
+                degraded_film = (
+                    self.settings.get("resolution", 0) == 0
+                    and full_res and pixels and pixels < 2_500_000
+                )
                 log_event(
                     "FILM",
-                    f"done engine={engine} out={output_name} {pw}x{ph} "
+                    f"done engine={engine} out={output_name} {pw}x{ph}"
+                    f"{' degraded=2MP' if degraded_film else ''} "
                     f"total={time.monotonic() - t_film0:.2f}s | {mem_snapshot()}"
                 )
-                self.set_status("SAVED +FILM " + size_tag, 5)
+                self.set_status("2MP - LOW MEM" if degraded_film else ("SAVED +FILM " + size_tag), 5)
             except Exception as exc:
                 log_event("ERR", f"film_job failed: {type(exc).__name__}: {exc} | {mem_snapshot()}")
                 self.set_status("FILM ERR " + str(exc)[:26], 10)
@@ -4557,11 +4633,18 @@ class FilmBoxUI:
         self.film_worker = threading.Thread(target=render, daemon=True)
         self.film_worker.start()
 
+    def _maybe_prewarm_gpu(self):
+        """Start the persistent GPU worker asynchronously when a LUT look is active."""
+        if (self.gpu_worker is not None
+                and self.settings["filter"].startswith(LUT_PREFIX)
+                and self.gpu_worker.state == "idle"):
+            self.gpu_worker.start()
+
     def do_photo(self):
         def operation():
-            # Free unused LUT caches and, if CMA is below 60 MB, release any idle
-            # _gpu-worker BEFORE attempting an 8MP capture. Keep 8MP as the primary
-            # target and only downgrade upfront when CMA < CMA_HARD_MIN_8MP_MB (26 MB).
+            # Always shoot full 8MP first (Linux migrates movable page cache out of
+            # CMA automatically). Only release a warm GPU worker upfront under true
+            # memory pressure (low MemAvailable AND low CmaFree), or on capture ENOMEM.
             _trim_lut_cache(keep_look=self.settings["filter"])
             target_res = RESOLUTIONS[self.settings["resolution"]]
             look = self.settings["filter"]
@@ -4573,26 +4656,26 @@ class FilmBoxUI:
             if target_res[0] * target_res[1] > 2_500_000:
                 if (self.gpu_worker is not None and self.gpu_worker.is_running()
                         and not self.film_busy):
+                    avail_now = available_mb()
                     cma_now = cma_free_mb()
-                    if cma_now is not None and cma_now < CMA_RELEASE_GPU_MB:
-                        self.gpu_worker.release(reason=f"cma={cma_now}MB<{CMA_RELEASE_GPU_MB}MB")
-                reclaim_memory()
-                cma_now = cma_free_mb()
-                if cma_now is not None and cma_now < CMA_SOFT_8MP_MB:
-                    _drop_page_cache()
-                    reclaim_memory()
-                    cma_now = cma_free_mb()
-                if cma_now is not None and cma_now < CMA_HARD_MIN_8MP_MB:
-                    log_event("PHOTO", f"hard_low_cma {cma_now}MB<{CMA_HARD_MIN_8MP_MB}MB -> 2MP | {mem_snapshot()}")
-                    self.set_status("LOW MEM - USING 2MP", 4)
-                    target_res = (1640, 1232)
-            else:
-                reclaim_memory()
+                    if (avail_now < MEM_PRESSURE_AVAIL_MB
+                            and cma_now is not None and cma_now < CMA_PRESSURE_MB):
+                        self.gpu_worker.release(
+                            reason=f"pressure(avail={avail_now}MB,cma={cma_now}MB)"
+                        )
+            reclaim_memory()
             original = reserve_path("Photos", "8mp" if target_res == SENSOR_SIZE
                                     else "photo", "jpg")
             click(self.settings["sound"])
-            self.stream.capture_still(original, target_res)
-            self.set_status("SAVED " + original.name[:24], 3)
+            def _on_enomem():
+                if self.gpu_worker is not None and self.gpu_worker.is_running() and not self.film_busy:
+                    self.gpu_worker.release(reason="capture_enomem")
+            res = self.stream.capture_still(original, target_res, on_enomem=_on_enomem)
+            degraded = bool(res[2]) if isinstance(res, tuple) and len(res) >= 3 else False
+            if degraded:
+                self.set_status("2MP - LOW MEM", 4)
+            else:
+                self.set_status("SAVED " + original.name[:24], 3)
             if look != "NORMAL":
                 self.film_job(original, look)
             else:
@@ -4821,6 +4904,7 @@ class FilmBoxUI:
                 self.set_status("LOOK " + LookPicker.label(self.picker.value)[:22], 3)
                 self.picker = None
                 _trim_lut_cache(keep_look=self.settings["filter"])
+                self._maybe_prewarm_gpu()
             return
         if self.share_overlay:
             if code in (ecodes.KEY_ESC, ecodes.KEY_W, ecodes.KEY_Q):
@@ -4925,6 +5009,7 @@ class FilmBoxUI:
             i = FILTERS.index(self.settings["filter"])
             self.settings["filter"] = FILTERS[(i + direction) % len(FILTERS)]
             self.touch_settings()
+            self._maybe_prewarm_gpu()
         elif code in (ecodes.KEY_7, ecodes.KEY_R):
             if self.mode == "STOPMOTION":
                 self.export_stopmotion()
@@ -4994,11 +5079,10 @@ class FilmBoxUI:
                 dropped = _drop_page_cache()
                 held_helpers = _suspend_helpers()
                 reclaim_memory()
-                # Right after a cold boot, system services may still be releasing
-                # transient CMA; give it up to 1.5s to settle if CmaFree < 45 MB.
-                cma_boot = cma_free_mb()
+                # Only wait briefly at boot if true MemAvailable is critically low
+                # (< 90 MB); low CmaFree with high Cached is normal movable cache.
                 settle_s = 0.0
-                if cma_boot is not None and cma_boot < CMA_SOFT_8MP_MB:
+                if available_mb() < 90:
                     self.safe_draw(draw_ui(
                         None, self.mode, self.settings["filter"],
                         RESOLUTION_LABELS[self.settings["resolution"]],
@@ -5011,14 +5095,13 @@ class FilmBoxUI:
                         time.sleep(0.3)
                         _drop_page_cache()
                         reclaim_memory()
-                        cma_boot = cma_free_mb()
-                        if cma_boot is None or cma_boot >= CMA_SOFT_8MP_MB:
+                        if available_mb() >= 90:
                             break
                     settle_s = time.monotonic() - t_settle0
                 tuning_p = resolve_tuning_file()
                 log_event(
                     "BOOT",
-                    f"FilmBox {VERSION} pid={os.getpid()} rss={_proc_rss_mb()}MB "
+                    f"FilmBox {VERSION} pid={os.getpid()} {_proc_mem_str()} "
                     f"accel={_ACCEL} filter={self.settings['filter']} "
                     f"cf={self.settings.get('colour_fix', 2)} "
                     f"tuning={tuning_p.name if tuning_p else 'system'} "
@@ -5033,6 +5116,10 @@ class FilmBoxUI:
                     f"start ok {self.stream.size[0]}x{self.stream.size[1]}@{self.stream.fps}fps "
                     f"({time.monotonic() - t_cam0:.2f}s) | {mem_snapshot()}"
                 )
+                # Warm `_gpu-worker` asynchronously AFTER the viewfinder is live if
+                # a LUT look is already selected (hides 2-4s EGL init behind framing);
+                # NORMAL mode stays zero-cost until the user selects a LUT.
+                self._maybe_prewarm_gpu()
             last_draw = 0.0
             last_status = None
             while self.running:
