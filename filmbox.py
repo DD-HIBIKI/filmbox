@@ -76,7 +76,7 @@ else:
     ecodes = None
     list_devices = None
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "FilmBox"
 

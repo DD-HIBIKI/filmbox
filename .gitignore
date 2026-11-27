@@ -7,3 +7,7 @@ var/
 logs/
 REVIEW*.md
 cybercam-film-share.patch
+
+# Measurement reports and comparison frames stay local
+docs/reports/
+docs/comparisons/
