@@ -258,3 +258,70 @@ Test between 10:00 and 14:00 on a clear day, pointing at open sky with the horiz
 roughly a third of the frame. Check `ColourTemperature` in the capture metadata first —
 if it reads below 5500 K the measurement is worthless, whatever the picture looks like.
 A screen cannot substitute for real sky, as this session demonstrated.
+
+---
+
+# Daylight test of the CCM candidate — 2026-11-27 12:05 (the test this document was waiting for)
+
+Conditions finally met: **6352 K**, 62609 lux, clear sky, 41 % of the frame is sky.
+This is the run that the "must be above 5500 K" rule was written for. Result:
+**the candidate makes the sky worse.**
+
+## Measurements
+
+| | sky RGB | B/G | R gain | G gain |
+|---|---|---|---|---|
+| default tuning | 101 / 106 / 194 | **1.82** | 1.748 | 1.420 |
+| `imx219-vc4-skyfix.json` | 94 / 99 / 189 | **1.91** | 1.859 | 1.371 |
+
+B/G moved **up** (worse) instead of down toward the iPhone reference of 1.41.
+Neutral surfaces also darkened slightly (25/24/26 → 23/22/23).
+
+## Why the CCM change backfired
+
+The intent was sound: in the 5858 K entry, lower the green-to-blue penalty
+(`-0.945 → -0.745`) so blue sky keeps more green. Mathematically, for a sky
+pixel where B > G, that raises G'.
+
+But the ISP does not stop at the CCM. **The AWB block re-estimates its gains
+from the corrected statistics**, and it moved the opposite way:
+
+```
+R gain  1.748 → 1.859   (+6 %)
+G gain  1.420 → 1.371   (−3 %)
+```
+
+More red, less green. That is precisely magenta. The net effect of the CCM edit
+was to push the AWB's idea of "neutral" — so the sky came out **more** violet
+than before the change.
+
+This is the general hazard of editing `rpi.ccm` alone: the CCM and the AWB are a
+closed loop, and moving one re-solves the other.
+
+## What this means for the project
+
+| Path | Sky B/G | Verdict |
+|---|---|---|
+| raw ISP, stock tuning | 1.82 | what the sensor actually produces at noon |
+| raw ISP, skyfix CCM | 1.91 | worse — do not use |
+| FilmBox `colour_fix` MED (Python, sky-only) | 1.42 | matches the iPhone reference |
+
+The Python-side correction already does what the tuning file was supposed to do,
+and it does it without fighting the AWB. **Do not ship the tuning candidate.**
+Keep it in `docs/tuning/` as a recorded negative result, with `FILMBOX_TUNING_FILE=0`
+available whenever someone wants to force the stock file.
+
+## If ISP-level correction is ever revisited
+
+Edit `rpi.awb` (`colour_gains` per illuminant) together with the CCM, or better,
+only the AWB: ask for higher G gain at the daylight entries and let the CCM stay
+stock. Verify by re-reading `ColourGains` from the capture metadata, not just by
+looking at the picture — as this session showed, the picture alone can point the
+wrong way.
+
+## Side note
+
+The frames came out upside down — the device was held rotated while pointed at
+the sky. Irrelevant for the colour statistics (the ROI is rotation-invariant),
+just noting it so the odd image is not mistaken for a capture bug.
+
